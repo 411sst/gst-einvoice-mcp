@@ -81,12 +81,14 @@ against. It works without configuration.
 
 ## MCP client configuration
 
+`pip install` puts a `gst-einvoice-mcp` command on your PATH, so a client only needs to
+name it:
+
 ```json
 {
   "mcpServers": {
     "gst-einvoice": {
-      "command": "C:/Shrish/GST MCP/.venv/Scripts/python.exe",
-      "args": ["-m", "gst_einvoice.server"],
+      "command": "gst-einvoice-mcp",
       "env": {
         "GROQ_API_KEY": "your-key-here",
         "GST_MCP_MODEL": "openai/gpt-oss-120b"
@@ -96,7 +98,24 @@ against. It works without configuration.
 }
 ```
 
-On Linux or macOS use `.venv/bin/python` instead.
+Running from a clone rather than an install? Point `command` at the interpreter inside your
+virtual environment and invoke the module directly:
+
+```json
+{
+  "mcpServers": {
+    "gst-einvoice": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["-m", "gst_einvoice.server"],
+      "env": {
+        "GROQ_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+On Windows that interpreter path ends `\.venv\Scripts\python.exe`.
 
 ### Tools
 
@@ -275,7 +294,7 @@ render — and the **lowest** confidence across a field's words is the one recor
 ## Development
 
 ```bash
-.venv/Scripts/python.exe -m pytest -q -W error
+pytest -q -W error
 ```
 
 1610 tests across ten modules, passing with warnings treated as errors. The LLM stage takes
