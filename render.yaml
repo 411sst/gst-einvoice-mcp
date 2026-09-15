@@ -1,0 +1,30 @@
+# Render deployment for the GST e-invoice MCP server.
+#
+# Tesseract is a SYSTEM dependency, not a Python one, so this runs on a Docker
+# runtime rather than Render's native Python runtime: the native runtime gives no
+# way to apt-get a binary, and the OCR path is dead without it.
+#
+# GROQ_API_KEY is deliberately NOT set here. It is marked sync:false so Render
+# prompts for it once in the dashboard and stores it as a secret; committing a key
+# to this file would publish it to anyone who can read the repository.
+services:
+  - type: web
+    name: gst-einvoice-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter        # OCR is memory-hungry; the free plan OOMs on large scans
+    # No healthCheckPath. The streamable-http transport exposes exactly one route,
+    # /mcp, and it speaks the MCP protocol rather than answering a plain GET, so
+    # pointing a health check at it reports the service down while it is running.
+    # Render falls back to checking that the port is open, which is what we want.
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false      # set in the Render dashboard, never in this file
+      - key: GST_MCP_MODEL
+        value: openai/gpt-oss-120b
+      - key: GST_MCP_TRANSPORT
+        value: streamable-http
+      - key: PORT
+        value: "10000"
+      - key: PYTHONUNBUFFERED
+        value: "1"

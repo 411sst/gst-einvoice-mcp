@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gst-einvoice"
+version = "0.1.0"
+description = "GST e-invoice extraction: Indian tax invoices in, INV-01 JSON plus validation warnings out"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.0",
+    "pymupdf>=1.24",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "pytesseract>=0.3.10",
+    "groq>=0.11",
+    # server.py uses the 2.x API (mcp.server.mcpserver.MCPServer). In 1.x that class
+    # is FastMCP at a different import path, so a 1.x install fails at import.
+    "mcp>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+gst-einvoice-mcp = "gst_einvoice.server:main"
+
+[tool.setuptools]
+packages = ["gst_einvoice"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
