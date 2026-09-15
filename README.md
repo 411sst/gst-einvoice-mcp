@@ -1,43 +1,28 @@
 # GST e-invoice extraction
 
-Turns an Indian GST tax invoice into the government's **INV-01 JSON payload**, and tells
-you exactly what it could not read.
+Turns an Indian GST tax invoice into the government's **INV-01 JSON payload**, and tells you exactly what it could not read.
 
-Ships as an [MCP](https://modelcontextprotocol.io) server with three tools, so an agent can
-parse a document, check a GSTIN, or re-validate a payload it already holds.
+Ships as an [MCP](https://modelcontextprotocol.io/) server with three tools, so an agent can parse a document, check a GSTIN, or re-validate a payload it already holds.
 
-> **It produces a submission-ready payload, not a filed invoice.** There is no IRN here. An
-> Invoice Reference Number is issued by the government's Invoice Registration Portal after
-> you submit the payload to it. Nothing in this repository talks to the IRP.
+> **It produces a submission-ready payload, not a filed invoice.** There is no IRN here. An Invoice Reference Number is issued by the government's Invoice Registration Portal after you submit the payload to it. Nothing in this repository talks to the IRP.
 
----
+------
 
 ## The idea
 
-An extraction tool that quietly guesses is worse than one that says it cannot read a field.
-A hallucinated digit in a GSTIN that still passes its checksum, or a line item that was
-never on the page, is the failure that costs an accountant real money — and it is invisible
-precisely because it looks right.
+An extraction tool that quietly guesses is worse than one that says it cannot read a field. A hallucinated digit in a GSTIN that still passes its checksum, or a line item that was never on the page, is the failure that costs an accountant real money — and it is invisible precisely because it looks right.
 
-So the design has one rule: **the model may structure text, it may never invent values.**
-That is enforced twice. The prompt says it, and then every value the model returns is
-checked back against the document text before it is kept. A value with no source in the
-document is replaced with null and reported, however plausible it looks. If that field is
-mandatory in INV-01, no payload is produced at all.
+So the design has one rule: **the model may structure text, it may never invent values.** That is enforced twice. The prompt says it, and then every value the model returns is checked back against the document text before it is kept. A value with no source in the document is replaced with null and reported, however plausible it looks. If that field is mandatory in INV-01, no payload is produced at all.
 
-Everything the tool knows about its own work — how each page was read, where each field came
-from, what it was unsure about — travels beside the payload in `extraction_meta`, never
-inside it. The payload stays strictly spec-pure, because the government API rejects unknown
-keys.
+Everything the tool knows about its own work — how each page was read, where each field came from, what it was unsure about — travels beside the payload in `extraction_meta`, never inside it. The payload stays strictly spec-pure, because the government API rejects unknown keys.
 
-**Read [LIMITATIONS.md](LIMITATIONS.md) before trusting the output.** It is specific about
-what the tool cannot corroborate, and what that costs you.
+**Read [LIMITATIONS.md](https://claude.ai/chat/LIMITATIONS.md) before trusting the output.** It is specific about what the tool cannot corroborate, and what that costs you.
 
----
+------
 
 ## Install
 
-Requires **Python 3.13** and **Tesseract OCR** as a system dependency.
+Requires **Python 3.11 or newer** and **Tesseract OCR** as a system dependency.
 
 ```bash
 # Tesseract (Windows)
@@ -48,41 +33,31 @@ sudo apt-get install -y tesseract-ocr
 
 # Tesseract (macOS)
 brew install tesseract
-```
-
-```bash
 python -m venv .venv
 .venv/Scripts/activate        # Windows
 # source .venv/bin/activate   # Linux / macOS
 pip install -e .
 ```
 
-Tesseract does not need to be on `PATH`: the OCR module looks there first, then at the
-standard Windows install location, and raises an actionable error naming both if neither
-works.
+Tesseract does not need to be on `PATH`: the OCR module looks there first, then at the standard Windows install location, and raises an actionable error naming both if neither works.
 
 ### Environment
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `GROQ_API_KEY` | yes | Stage 2 reads the line-item table through Groq |
-| `GST_MCP_MODEL` | recommended | Pin the model your key can reach |
-| `GST_MCP_TRANSPORT` | no | `stdio` (default), `sse`, or `streamable-http` |
+| Variable            | Required    | Purpose                                        |
+| ------------------- | ----------- | ---------------------------------------------- |
+| `GROQ_API_KEY`      | yes         | Stage 2 reads the line-item table through Groq |
+| `GST_MCP_MODEL`     | recommended | Pin the model your key can reach               |
+| `GST_MCP_TRANSPORT` | no          | `stdio` (default), `sse`, or `streamable-http` |
 
-The default model is `openai/gpt-oss-120b`, which is what this release was validated
-against. It works without configuration.
+The default model is `openai/gpt-oss-120b`, which is what this release was validated against. It works without configuration.
 
-> **Still set `GST_MCP_MODEL` in a deployment.** A hard-coded model identifier expires
-> silently when the provider retires it, and the failure arrives as an HTTP 404 that reads
-> like a bad key rather than a stale constant. Pin the model you have access to, and check
-> it against Groq's deprecation notices.
+> **Still set `GST_MCP_MODEL` in a deployment.** A hard-coded model identifier expires silently when the provider retires it, and the failure arrives as an HTTP 404 that reads like a bad key rather than a stale constant. Pin the model you have access to, and check it against Groq's deprecation notices.
 
----
+------
 
 ## MCP client configuration
 
-`pip install` puts a `gst-einvoice-mcp` command on your PATH, so a client only needs to
-name it:
+`pip install` puts a `gst-einvoice-mcp` command on your PATH, so a client only needs to name it:
 
 ```json
 {
@@ -98,8 +73,7 @@ name it:
 }
 ```
 
-Running from a clone rather than an install? Point `command` at the interpreter inside your
-virtual environment and invoke the module directly:
+Running from a clone rather than an install? Point `command` at the interpreter inside your virtual environment and invoke the module directly:
 
 ```json
 {
@@ -119,23 +93,19 @@ On Windows that interpreter path ends `\.venv\Scripts\python.exe`.
 
 ### Tools
 
-| Tool | Takes | Gives back |
-|---|---|---|
-| `parse_invoice` | a file path, optional tolerance | the INV-01 payload, missing fields, refusals, and `extraction_meta` |
-| `validate_gstin` | a GSTIN | structure, checksum, state code, PAN, and the reason on failure |
-| `validate_payload` | an INV-01 payload | the four consistency checks over a payload you already hold |
+| Tool               | Takes                           | Gives back                                                   |
+| ------------------ | ------------------------------- | ------------------------------------------------------------ |
+| `parse_invoice`    | a file path, optional tolerance | the INV-01 payload, missing fields, refusals, and `extraction_meta` |
+| `validate_gstin`   | a GSTIN                         | structure, checksum, state code, PAN, and the reason on failure |
+| `validate_payload` | an INV-01 payload               | the four consistency checks over a payload you already hold  |
 
 `parse_invoice` has **three normal outcomes**, and only the first gives you a payload:
 
-1. **A payload plus warnings.** Usable, but the warnings say which fields were read at low
-   OCR confidence, which were assigned by position rather than by a label, and which were
-   derived rather than printed.
-2. **No payload, `missing_fields` populated.** A mandatory field could not be read. Nothing
-   was invented to fill the gap, which is why there is no payload.
-3. **No payload, `refusals` populated.** Export, SEZ and foreign-currency invoices are
-   refused by design, with a message saying what was detected and what to do instead.
+1. **A payload plus warnings.** Usable, but the warnings say which fields were read at low OCR confidence, which were assigned by position rather than by a label, and which were derived rather than printed.
+2. **No payload, `missing_fields` populated.** A mandatory field could not be read. Nothing was invented to fill the gap, which is why there is no payload.
+3. **No payload, `refusals` populated.** Export, SEZ and foreign-currency invoices are refused by design, with a message saying what was detected and what to do instead.
 
----
+------
 
 ## Worked example
 
@@ -157,9 +127,6 @@ Sl 1 Laptop Stand HSN/SAC: 8471 Qty 4 NOS Rate 1500.00
 Taxable 6000.00  GST 18%  CGST 540.00  SGST 540.00  IGST 0.00  Line Total 7080.00
 Taxable 6000.00  CGST 540.00  SGST 540.00  IGST 0.00
 Total Invoice Value 7080.00
-```
-
-```python
 from gst_einvoice.extract_llm import make_client
 from gst_einvoice.pipeline import extract_invoice
 
@@ -222,8 +189,7 @@ result = extract_invoice("invoice.pdf", client=make_client())
 
 ### The warnings block
 
-This is the half most tools do not give you. Seven entries, from the run above, one
-`warning` and six `info`:
+This is the half most tools do not give you. Seven entries, from the run above, one `warning` and six `info`:
 
 ```
 [warning] extract_llm  ItemList[0].SlNo
@@ -254,20 +220,13 @@ This is the half most tools do not give you. Seven entries, from the run above, 
     CGST/SGST-versus-IGST split follows the place of supply.
 ```
 
-Nothing in that list means the payload is wrong. Each one names something the tool could
-not corroborate, so you know where to look. The four arithmetic validators raised nothing,
-which is what silence from them means.
+Nothing in that list means the payload is wrong. Each one names something the tool could not corroborate, so you know where to look. The four arithmetic validators raised nothing, which is what silence from them means.
 
-On an invoice whose template omits a column — an intra-state invoice with no IGST column,
-or one that prints a taxable value but no separate gross — you will also see a `pipeline`
-note saying the field was derived rather than read, and `field_provenance` will record it
-as `"source": "derived"`.
+On an invoice whose template omits a column — an intra-state invoice with no IGST column, or one that prints a taxable value but no separate gross — you will also see a `pipeline` note saying the field was derived rather than read, and `field_provenance` will record it as `"source": "derived"`.
 
 ### Provenance
 
-`extraction_meta.field_provenance` carries an entry for **every** field in the payload — 45
-for this invoice — saying which stage produced it and, for a scanned page, the OCR
-confidence of the text it was read from:
+`extraction_meta.field_provenance` carries an entry for **every** field in the payload — 45 for this invoice — saying which stage produced it and, for a scanned page, the OCR confidence of the text it was read from:
 
 ```json
 {
@@ -279,17 +238,16 @@ confidence of the text it was read from:
 }
 ```
 
-On a scanned page the same fields carry real numbers — 0.86 to 0.96 on a clean 300 dpi
-render — and the **lowest** confidence across a field's words is the one recorded.
+On a scanned page the same fields carry real numbers — 0.86 to 0.96 on a clean 300 dpi render — and the **lowest** confidence across a field's words is the one recorded.
 
-| `source` | Meaning |
-|---|---|
-| `regex` | Confirmed deterministically, structurally certain |
-| `llm` | Structured by the model, then verified against the document text |
+| `source`  | Meaning                                                      |
+| --------- | ------------------------------------------------------------ |
+| `regex`   | Confirmed deterministically, structurally certain            |
+| `llm`     | Structured by the model, then verified against the document text |
 | `derived` | Follows by rule from values that were read; not printed on the page |
 | `assumed` | Neither read nor derived — an assumption the tool names explicitly |
 
----
+------
 
 ## Development
 
@@ -297,25 +255,23 @@ render — and the **lowest** confidence across a field's words is the one recor
 pytest -q -W error
 ```
 
-1610 tests across ten modules, passing with warnings treated as errors. The LLM stage takes
-an injected client, so the whole suite runs with no API key and no network.
+1610 tests across ten modules, passing with warnings treated as errors. The LLM stage takes an injected client, so the whole suite runs with no API key and no network.
 
-| Module | What it does |
-|---|---|
-| `gstin.py` | Structure and mod-36 checksum |
-| `state_codes.py` | State code table, including discontinued 25 and legacy 28 |
-| `schema.py` | INV-01 pydantic models, `extra="forbid"` throughout |
-| `validators.py` | The four arithmetic and tax-split checks |
-| `ingest.py` | Per-page routing and the detect-and-refuse rules |
-| `ocr.py` | Tesseract with per-word confidence mapped onto character spans |
+The suite passes on both 3.11 and 3.13; 3.11 is the floor because that is the lowest version the whole dependency set resolves on, and it was verified by running the suite there rather than assumed.
+
+| Module             | What it does                                                 |
+| ------------------ | ------------------------------------------------------------ |
+| `gstin.py`         | Structure and mod-36 checksum                                |
+| `state_codes.py`   | State code table, including discontinued 25 and legacy 28    |
+| `schema.py`        | INV-01 pydantic models, `extra="forbid"` throughout          |
+| `validators.py`    | The four arithmetic and tax-split checks                     |
+| `ingest.py`        | Per-page routing and the detect-and-refuse rules             |
+| `ocr.py`           | Tesseract with per-word confidence mapped onto character spans |
 | `extract_rules.py` | Deterministic extraction: GSTINs, parties, number, date, HSN |
-| `extract_llm.py` | The LLM stage and the grounding check |
-| `pipeline.py` | End-to-end assembly |
-| `server.py` | The MCP server |
+| `extract_llm.py`   | The LLM stage and the grounding check                        |
+| `pipeline.py`      | End-to-end assembly                                          |
+| `server.py`        | The MCP server                                               |
 
 ## Licence note
 
-This project depends on **PyMuPDF**, which is AGPL-3.0. That is a deliberate choice, made
-because PyMuPDF opens image files directly as one-page documents and gave more reliable
-text-layer detection than the alternatives. If you intend to distribute this tool as part
-of a closed-source product, check that licence first.
+This project depends on **PyMuPDF**, which is AGPL-3.0. That is a deliberate choice, made because PyMuPDF opens image files directly as one-page documents and gave more reliable text-layer detection than the alternatives. If you intend to distribute this tool as part of a closed-source product, check that licence first.
