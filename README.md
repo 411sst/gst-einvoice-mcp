@@ -16,7 +16,7 @@ So the design has one rule: **the model may structure text, it may never invent 
 
 Everything the tool knows about its own work — how each page was read, where each field came from, what it was unsure about — travels beside the payload in `extraction_meta`, never inside it. The payload stays strictly spec-pure, because the government API rejects unknown keys.
 
-**Read [LIMITATIONS.md](https://claude.ai/chat/LIMITATIONS.md) before trusting the output.** It is specific about what the tool cannot corroborate, and what that costs you.
+**Read [LIMITATIONS.md](LIMITATIONS.md) before trusting the output.** It is specific about what the tool cannot corroborate, and what that costs you.
 
 ------
 
@@ -33,6 +33,13 @@ sudo apt-get install -y tesseract-ocr
 
 # Tesseract (macOS)
 brew install tesseract
+```
+
+```bash
+# From PyPI -- installs the `gst-einvoice-mcp` command the MCP client configuration below names
+pip install gst-einvoice-mcp
+
+# Or from a clone, for development (editable)
 python -m venv .venv
 .venv/Scripts/activate        # Windows
 # source .venv/bin/activate   # Linux / macOS
@@ -257,7 +264,7 @@ On a scanned page the same fields carry real numbers — 0.86 to 0.96 on a clean
 pytest -q -W error
 ```
 
-1617 tests across ten modules, passing with warnings treated as errors. The LLM stage takes an injected client, so the whole suite runs with no API key and no network.
+1644 tests across ten modules, passing with warnings treated as errors. The LLM stage takes an injected client, so the whole suite runs with no API key and no network.
 
 The suite passes on both 3.11 and 3.13; 3.11 is the floor because that is the lowest version the whole dependency set resolves on, and it was verified by running the suite there rather than assumed.
 
