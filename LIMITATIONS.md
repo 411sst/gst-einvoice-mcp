@@ -211,16 +211,58 @@ prints its total once at the foot rather than twice.
 
 Where such a field is absent, the tool fills it from a rule rather than reporting the
 document unreadable, and records `"source": "derived"` in provenance with an informational
-note on every affected field. There are three such rules:
+note on every affected field. There are five such rules:
 
 - the tax head that cannot apply is set to zero, from the two validated state codes;
 - `TotAmt` is set to `AssAmt + Discount`, the INV-01 identity;
+- `AssAmt` is set to `TotAmt - Discount` — the exact inverse, confined to the same row —
+  when the taxable value came back null and the gross on that row was read. The two rules
+  are a single if/elif over the same pair of fields, each firing only when its own target
+  is null and the other side was read, so they are mutually exclusive by construction and
+  a row with neither amount refuses on both sides. **The discount caveat, plainly:** if
+  the invoice prints a discount that stage 2 did not read, the discount defaults to zero
+  and the derived taxable value equals the gross — wrong by exactly the discount. The
+  derivation note says this in as many words, and the arithmetic checks compare the
+  derived value against the row's own total and the document totals, so a real
+  disagreement is flagged beside it rather than passing silently;
 - `TotItemVal` is set to `AssAmt + CgstAmt + SgstAmt + IgstAmt + CesAmt + StateCesAmt +
   OthChrg` — the identity `validate_item_total` enforces — but **only** when both of these
   hold:
   1. the invoice has **exactly one line item**, and
   2. the derived value **reconciles with the printed `ValDtls.TotInvVal`**, within the same
-     tolerance the validators compare on (0.05 by default).
+     tolerance the validators compare on (0.05 by default);
+- an absent `ValDtls` total is set equal to its `ItemList` counterpart — `AssVal` from
+  `AssAmt`, `CgstVal` from `CgstAmt`, `SgstVal` from `SgstAmt`, `IgstVal` from `IgstAmt`,
+  `CesVal` from `CesAmt`, `StCesVal` from `StateCesAmt` — under the same two conditions,
+  plus a third:
+  1. the invoice has **exactly one line item**, on which each document total is
+     definitionally the same number as its row counterpart;
+  2. the **completed totals block reconciles with the printed `ValDtls.TotInvVal`**, on the
+     identity `validate_invoice_total` enforces, within the same tolerance — all recovered
+     totals commit together or not at all; and
+  3. the row counterpart was **read by stage 2 off the page** (`"source": "llm"`), never
+     itself derived.
+
+**Derivation runs in one direction only.** The totals rule fills a `ValDtls` total from a
+row value, and no rule anywhere fills a row value from a `ValDtls` total. The direction
+constraint is what makes the rule sound: the item-side rules can themselves derive fields
+(the inapplicable tax head, `TotAmt`), and a rule that consumed a derived counterpart —
+or a pair of rules pointing in both directions across the same field pair — would let a
+value neither stage read bootstrap itself into the payload through two "derivations" that
+each cite the other. When both sides of a pair are absent, both are reported missing and
+no payload is produced. Chains are cut at the row/totals boundary for the same reason: a
+row `AssAmt` recovered from its own read gross is a derivation, so it never feeds
+`ValDtls.AssVal` in turn — across that boundary, every derived value cites a reading
+directly. Within a row the identities may compose: a single-line invoice whose response
+dropped both `AssAmt` and `TotItemVal` recovers the first from the read gross and the
+second from the item identity that consumes it — but that composition commits only when
+the result reconciles with the printed `ValDtls.TotInvVal`, so every within-row chain is
+anchored in read values and corroborated by the document's own foot. The consequence of the
+one-way direction is visible in the live measurements below: a row whose taxable value
+AND gross both came back null stays missing even when the totals block was read, because
+recovering a row value from `AssVal` is the forbidden direction.
+(`StCesVal`/`StateCesAmt` is listed for completeness but cannot fire today: stage 2
+extracts neither side, so the counterpart is never a stage-2 reading.)
 
 **Why the per-line total is restricted to single-row invoices.** On a one-row invoice the
 per-row total and the document total are the same number, so the printed foot corroborates
@@ -361,7 +403,9 @@ discount. The model correctly answered null for a column that is not on the page
 pipeline correctly refused to invent it. The first two derivation rules above — the
 inapplicable tax head and `TotAmt` — were added in response, and they are what took the
 pass rate from four to eleven. The third, the single-row `TotItemVal`, came later, from the
-same failure appearing on a document this suite's own "clean" fixture models.
+same failure appearing on a document this suite's own "clean" fixture models. The fourth,
+the single-line `ValDtls` totals, came from the 59-run measurement described under Known
+open issues, after the failure it addresses reproduced in live use.
 
 ---
 
@@ -396,43 +440,97 @@ document can yield a payload on one attempt and a missing-field report on the ne
 right thing happens on both — the field is reported missing and no payload is produced,
 rather than a value being invented — but the two runs disagree.
 
-**The rate has been measured.** Running stage 2 against `sample_invoice.pdf` 42 times, at
-temperature zero, with the same prompt and the same model (`openai/gpt-oss-120b`):
+**The rate has been measured, end to end.** Running the **full pipeline** against
+`sample_invoice.pdf` 60 times on 2026-09-16, at temperature zero, same prompt, same model
+(`openai/gpt-oss-120b`), before the totals derivation below existed. One run died on an
+HTTP 429 and is excluded as an API failure, leaving 59 valid runs:
 
-| Field | Runs | Populated | Null |
-| ----- | ---- | --------- | ---- |
-| `ItemList[0].TotItemVal` | 42 | 28 | **14 (33%)** |
-| `ValDtls.AssVal`, `CgstVal`, `SgstVal`, `IgstVal`, `TotInvVal` | 42 | 42 | 0 |
-| `ItemList[0].AssAmt` | 12 | 12 | 0 |
+- **8 of 59 runs (13.6%) produced no payload at all.** The blocking fields:
+  `ValDtls.AssVal` in 7 of the 8 (null in 11.9% of all runs), `ValDtls.CgstVal` and
+  `SgstVal` in 3 (5.1% each, always together with `AssVal`, never alone), and
+  `ItemList[0].AssAmt` in 1 (1.7%, alone).
+- **No run produced a wrong value.** All 51 successful runs returned byte-identical
+  payloads. Model-side `TotItemVal` nulls occurred 14 times and blocked nothing — the
+  single-row derivation absorbed every one. The only failure mode observed is absence.
+- In **every** run where `ValDtls.AssVal` came back null, the same response carried
+  `ItemList[0].AssAmt` read correctly, and the printed `TotInvVal` besides. The
+  information was present each time; only the totals-block field was dropped.
 
-(`AssAmt` was recorded over only the first 12 of those runs, so its sample is smaller; the
-other rows cover all 42.)
+An earlier, stage-2-only measurement of 42 runs had put the `TotItemVal` null rate at 33%
+and seen zero `ValDtls` nulls; a still earlier note here called the grouped
+`AssVal`/`CgstVal`/`SgstVal` null "observed once, unreproduced across 66 runs". The 59-run
+measurement supersedes both: the totals failure is real, reproducible, and was the single
+largest cause of a lost payload on this document.
 
-Roughly one run in three failed to read a single field, with nothing about the input
-changing between runs. That number is what tells you how much to trust a single run: on a
-document of this shape, one attempt is not a reading of the document, it is one sample.
+That is what motivated the fourth derivation rule above. **After the rule, the same 60-run
+measurement was repeated against the new code:** 5 of 60 runs (8.3%) produced no payload,
+and none of them was blocked solely by a `ValDtls` total — the rule fired in 5 runs and recovered
+a correct payload each time, and one further run had `AssVal` and `AssAmt` null together,
+which is refused by design. Every remaining failure was the row-level
+`ItemList[0].AssAmt` coming back null — and in all five, the same row's `TotAmt` was read
+correctly, which is what motivated the row-internal `AssAmt` rule above, added in the
+release after that measurement. Two caveats on comparing the numbers:
+the row-level null rate itself differed between the two batches (1/59 before, 5/60 after),
+so 13.6% versus 8.3% is two samples of a drifting distribution, not a controlled delta;
+what the change is actually evidenced to do is remove the `ValDtls`-total blocking class
+(7/59 before, 0/60 after). And both batches are one document; nothing here says what the
+rates are on other layouts.
+
+**Measured, after the row-internal `AssAmt` rule and the retry: 0 of 60 runs produced no
+payload.** The same 60-run measurement was repeated once the quota window cleared (a
+first attempt had hit the API key's 200,000 tokens-per-day ceiling and yielded only 7
+usable runs; this is the full batch — 60 of 60 valid, no API errors). Every run produced
+a payload, and all 60 payloads are byte-identical. Zero failures in 60 runs bounds the
+no-payload rate on this document below roughly 5% at 95% confidence; it does not mean
+zero.
+
+Shape by shape, 30 of the 60 first responses dropped at least one field, and the
+derivations absorbed 28 of them outright: `TotItemVal` null in 30 first responses (50%,
+as in the batch before it; the first full batch had 24% — the distribution drifts),
+`TotAmt` null in 6, the grouped `AssVal`/`CgstVal`/`SgstVal` totals null in 3, lone
+`AssVal` nulls in 2 more. The remaining 2 first responses were the chain-locked shape —
+`AssAmt` and `AssVal` null together, where the derived `AssAmt` is rightly refused as a
+source for `AssVal` — and the retry recovered both runs on the second attempt, each
+recording `attempts: 2`. One of those second attempts came back with `AssAmt` null
+again and `AssVal` read, the exact shape the previous batch's failures had, and the
+`AssAmt` rule derived it (6000.00, the correct value) into the final payload: the retry
+and the derivation composed, and each was necessary for that run.
+
+The honest comparison: 13.6%, then 8.3%, now 0% is three samples of a drifting
+distribution, not a trend line — the per-field null rates moved substantially between
+every pair of batches (`AssAmt` null in 1.7%, then 8.3%, now 3.3% of first responses).
+What this batch is evidence for is narrower and more useful: every failure shape
+recorded across the 179 valid runs of the three full batches now has a countermeasure
+that has been observed working live — an identity derivation for every shape where the
+value was read elsewhere in the same response, the retry for the one shape where it was
+not — and no run in any batch has ever produced a wrong value. Still one document;
+nothing here says what the rates are on other layouts.
 
 This is **provider-side non-determinism at temperature zero** — an artefact of mixture-of-
 experts routing and request batching, not of sampling temperature and not of the prompt.
 No prompt change fixes it, and `temperature` is already zero. Retrying a document that came
-back with a field missing is legitimate and, at a 33% per-field failure rate, often
+back with a field missing is legitimate and, at the measured no-payload rates, often
 worthwhile. What you must not do is treat a second, fuller answer as proof the first was
 faulty, or a missing-field report as proof about the invoice.
 
-**One observation that is not characterised.** On a single run through the MCP server,
-`ValDtls.AssVal`, `CgstVal` and `SgstVal` all came back null together while `TotInvVal` was
-read normally. It has **never reproduced**: 66 subsequent runs against the same document,
-the same stage-2 code and the same model produced it zero times. It is recorded here as
-observed once and unreproduced, not as a known failure mode, because one occurrence cannot
-establish a rate.
+**The pipeline now performs that retry itself, once, and says so.** A run that produces
+no payload with nothing refused is retried one time, because at the measured rates such a
+run is far more often a resampling flake than a fact about the document. A refusal is
+never retried: an export or foreign-currency invoice is a decision, and a second call
+would spend money to reach the same correct answer. The two responses are never merged —
+each is only internally coherent, so the second is taken whole or not at all, and a
+second failure is the honest answer rather than a third attempt.
+`extraction_meta.attempts` records the count, and an informational note is emitted
+whenever it is 2, which is the condition the retry is defensible on at all: a change in
+the underlying failure rate must never be able to hide behind a silent retry.
 
-What makes it hard to dismiss as noise is that the failing run returned a *coherent partial
-reading* rather than corruption: `sample_invoice.pdf` has no separate totals block — its
-taxable and tax figures are printed on the item row, and the only document-level figure is
-the invoice total — so declining to reuse the item row's amounts as invoice totals is a
-defensible reading of that document. A rare semantic waver and rare noise that happened to
-look coherent cannot be told apart from one occurrence, so neither is claimed. Nothing
-derives `ValDtls.AssVal`, so if it does recur it blocks a payload.
+What kept the totals failure from being dismissed as noise is that it is a *coherent
+partial reading* rather than corruption: `sample_invoice.pdf` has no separate totals
+block — its taxable and tax figures are printed on the item row, and the only
+document-level figure is the invoice total — so declining to reuse the item row's amounts
+as invoice totals is a defensible reading of that document. The derivation rule encodes
+the opposite reading, and only where it is definitionally safe: on a single-line invoice,
+from row values that were read, reconciled against the printed total.
 
 **Clearer labels on the invoice make extraction worse, not better.** The obvious response to
 a field that reads unreliably is to label it more explicitly on the document. That was

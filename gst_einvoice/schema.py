@@ -150,6 +150,10 @@ class ExtractionMeta(BaseModel):
     pages: list[PageMeta] = Field(default_factory=list)
     field_provenance: dict[str, Any] = Field(default_factory=dict)
     warnings: list[ExtractionWarning] = Field(default_factory=list)
+    #: How many stage-2 attempts this result took. 1 for almost every run; 2 when
+    #: the pipeline retried a no-payload, no-refusal outcome. Recorded so a change
+    #: in the underlying failure rate can never hide behind a silent retry.
+    attempts: int = 1
 
 
 class ExtractionResult(BaseModel):

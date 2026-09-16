@@ -119,19 +119,25 @@ Plot 14 MIDC Andheri East
 Mumbai 400093
 Invoice No: INV-2026-0042
 Invoice Date: 17/04/2026
-Bill To: Kanchan Electricals LLP
+Buyer: Kanchan Electricals LLP
 GSTIN 27AABCB5507N1ZJ
-18 Connaught Place
+221 Laxmi Road Shivajinagar
 Pune 411005
-Sl 1 Laptop Stand HSN/SAC: 8471 Qty 4 NOS Rate 1500.00
-Taxable 6000.00  GST 18%  CGST 540.00  SGST 540.00  IGST 0.00  Line Total 7080.00
-Taxable 6000.00  CGST 540.00  SGST 540.00  IGST 0.00
+Sl No 01 Laptop Stand
+Qty 4 NOS Rate 1500.00
+Taxable 6000.00 GST 18%
+CGST 540.00 SGST 540.00 IGST 0.00
+HSN/SAC: 8471
+Goods once sold will not be taken back or exchanged
 Total Invoice Value 7080.00
+```
+
+```python
 from gst_einvoice.extract_llm import make_client
 from gst_einvoice.pipeline import extract_invoice
 
 # model defaults to openai/gpt-oss-120b; pass model=... to override
-result = extract_invoice("invoice.pdf", client=make_client())
+result = extract_invoice("sample_invoice.pdf", client=make_client())
 ```
 
 ### The payload
@@ -152,7 +158,7 @@ result = extract_invoice("invoice.pdf", client=make_client())
   "BuyerDtls": {
     "Gstin": "27AABCB5507N1ZJ",
     "LglNm": "Kanchan Electricals LLP",
-    "Addr1": "18 Connaught Place",
+    "Addr1": "221 Laxmi Road Shivajinagar",
     "Loc": "Pune",
     "Pin": 411005,
     "Stcd": "27",
@@ -160,7 +166,7 @@ result = extract_invoice("invoice.pdf", client=make_client())
   },
   "ItemList": [
     {
-      "SlNo": "1",
+      "SlNo": "01",
       "PrdDesc": "Laptop Stand",
       "IsServc": "N",
       "HsnCd": "8471",
@@ -189,20 +195,15 @@ result = extract_invoice("invoice.pdf", client=make_client())
 
 ### The warnings block
 
-This is the half most tools do not give you. Seven entries, from the run above, one `warning` and six `info`:
+This is the half most tools do not give you. Six entries, from the run above, all `info`:
 
 ```
-[warning] extract_llm  ItemList[0].SlNo
-    "1" is a single character. It is printed as a token of its own in the document,
-    which is why ItemList[0].SlNo was kept rather than dropped, but one character
-    matches almost any page by accident, so the corroboration is weak. Confirm it
-    against the invoice by eye — on a line item, that means the row numbering.
-
 [info]    extract_llm  ItemList[0].HsnCd
     "8471" is not printed as a code of its own in this row's text: it was grounded by
     the HSN/SAC codes stage 1 confirmed, or by a longer number elsewhere on the page.
-    Which code belongs to which row is the model's judgement, which the grounding
-    check cannot corroborate.
+    Which code belongs to which row is therefore the model's judgement and could not
+    be corroborated against the document. A code on the wrong row changes that row's
+    tax classification, so confirm it against the invoice.
 
 [info]    extract_llm  ItemList[0].Discount
     ItemList[0].Discount was not found in the document: the model returned no value
@@ -213,16 +214,17 @@ This is the half most tools do not give you. Seven entries, from the run above, 
 [info]    extract_llm  ValDtls.RndOffAmt         (same wording)
 
 [info]    pipeline     BuyerDtls.Pos
-    BuyerDtls.Pos (place of supply) was not read from the document — build 2 does not
-    extract it — so it was assumed equal to the buyer's registered state code (27).
-    A genuine bill-to/ship-to supply, where the goods go to a different state from
-    the one the buyer is registered in, has a different place of supply, and the
-    CGST/SGST-versus-IGST split follows the place of supply.
+    BuyerDtls.Pos (place of supply) was not read from the document -- build 2 does
+    not extract it -- so it was assumed equal to the buyer's registered state code
+    (27). A genuine bill-to/ship-to supply, where the goods go to a different state
+    from the one the buyer is registered in, has a different place of supply, and
+    the CGST/SGST-versus-IGST split follows the place of supply. Confirm it against
+    the document before filing.
 ```
 
 Nothing in that list means the payload is wrong. Each one names something the tool could not corroborate, so you know where to look. The four arithmetic validators raised nothing, which is what silence from them means.
 
-On an invoice whose template omits a column — an intra-state invoice with no IGST column, or one that prints a taxable value but no separate gross — you will also see a `pipeline` note saying the field was derived rather than read, and `field_provenance` will record it as `"source": "derived"`. The same applies to the per-line total on a **single-line** invoice that prints its total only at the foot: it is derived from the INV-01 item identity, but only when the invoice has exactly one line item and the derived value reconciles with the printed `ValDtls.TotInvVal`. On a multi-line invoice a missing `TotItemVal` is still reported missing and no payload is produced — see [LIMITATIONS.md](LIMITATIONS.md) for why.
+On an invoice whose template omits a column — an intra-state invoice with no IGST column, or one that prints a taxable value but no separate gross — you will also see a `pipeline` note saying the field was derived rather than read, and `field_provenance` will record it as `"source": "derived"`. Five rules can do this: the tax head that cannot apply is set to zero from the two state codes; a row's gross is filled from its taxable value and discount, and a row's taxable value from its gross, each the other's exact inverse and never both on one row; the per-line total on a **single-line** invoice that prints its total only at the foot is filled from the INV-01 item identity; and a document total the model dropped is filled from its row counterpart, again only on a single-line invoice. The last two fire only when the result reconciles with the printed `ValDtls.TotInvVal`, and a derived value never feeds another derivation across the row/totals boundary. On a multi-line invoice a missing `TotItemVal` or document total is still reported missing and no payload is produced — see [LIMITATIONS.md](LIMITATIONS.md) for why.
 
 ### Provenance
 

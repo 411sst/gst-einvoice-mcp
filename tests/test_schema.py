@@ -628,7 +628,7 @@ def test_extraction_result_json_shape():
     dumped = ExtractionResult.model_validate(result_data()).model_dump(exclude_none=True)
     assert set(dumped) == {"invoice", "extraction_meta"}
     assert set(dumped["invoice"]) == INVOICE_KEYS
-    assert set(dumped["extraction_meta"]) == {"pages", "field_provenance", "warnings"}
+    assert set(dumped["extraction_meta"]) == {"pages", "field_provenance", "warnings", "attempts"}
 
 
 def test_minimal_extraction_result_round_trips_through_json():

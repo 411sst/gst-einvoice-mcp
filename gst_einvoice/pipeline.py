@@ -129,6 +129,23 @@ MANDATORY_ITEM_FIELDS: tuple[str, ...] = (
 #: INV-01 ``ValDtls`` totals that are mandatory.
 MANDATORY_TOTALS: tuple[str, ...] = ("AssVal", "CgstVal", "SgstVal", "IgstVal", "TotInvVal")
 
+#: Each ``ValDtls`` total and the item field it definitionally equals on an invoice
+#: with exactly one line item. The derivation below fills an absent total ONLY from
+#: a counterpart stage 2 read off the page (provenance source ``llm``), never from
+#: one this module itself derived, and no rule anywhere fills an item field from
+#: one of these totals -- so the two directions cannot chain and an absent pair
+#: cannot bootstrap itself into existence. ``StCesVal``/``StateCesAmt`` is inert
+#: today, because stage 2 extracts neither side; it is listed so the identity set
+#: is complete and the direction is already fixed if that ever changes.
+TOTAL_FROM_ITEM: tuple[tuple[str, str], ...] = (
+    ("AssVal", "AssAmt"),
+    ("CgstVal", "CgstAmt"),
+    ("SgstVal", "SgstAmt"),
+    ("IgstVal", "IgstAmt"),
+    ("CesVal", "CesAmt"),
+    ("StCesVal", "StateCesAmt"),
+)
+
 #: The currency glyphs build 1's multi-currency detector fires on by themselves, and
 #: the token they were read inside, for quoting back at the accountant.
 CURRENCY_GLYPHS = "$€£¥"
@@ -381,6 +398,32 @@ def _gross_from_taxable_note(path: str, assamt: float, discount: float) -> Extra
     )
 
 
+def _taxable_from_gross_note(path: str, totamt: float, discount: float) -> ExtractionWarning:
+    """Report a taxable value filled from the gross amount and the discount.
+
+    The exact inverse of :func:`_gross_from_taxable_note`'s rule, confined to the
+    same row. The two rules are one if/elif on the same pair of fields, each
+    firing only when its own target is null and the other side was read, so they
+    are mutually exclusive by construction and a both-null row refuses on both
+    sides.
+    """
+    return _note(
+        path,
+        f"{path} (taxable value) is mandatory in INV-01 but stage 2 returned no value for "
+        f"it, while the gross amount on the same row was read. It was set to "
+        f"{totamt - discount:.2f} from the INV-01 identity AssAmt = TotAmt - Discount -- "
+        f"the exact inverse of the rule that fills an unprinted gross amount -- using the "
+        f"gross amount {totamt:.2f} and the discount {discount:.2f}. It was derived, not "
+        f"read from the page. Mind the discount: if this invoice prints a discount that "
+        f"was not read, the discount used here is zero and this derived taxable value "
+        f"equals the gross amount -- wrong by exactly the discount. The arithmetic checks "
+        f"compare this value against the row's own total and against the document totals, "
+        f"so a real disagreement is flagged beside it; if one is, check the invoice's "
+        f"discount line first.",
+        severity="info",
+    )
+
+
 def _single_row_total_note(
     path: str, value: float, printed_total: float, tolerance: float
 ) -> ExtractionWarning:
@@ -398,13 +441,44 @@ def _single_row_total_note(
         f"{path} (per-line total) is mandatory in INV-01 but is not printed as a column "
         f"of its own on this document. It was set to {value:.2f} from the INV-01 identity "
         f"TotItemVal = AssAmt + CgstAmt + SgstAmt + IgstAmt + CesAmt + StateCesAmt + "
-        f"OthChrg -- the identity validate_item_total enforces -- using the amounts that "
-        f"were read. It was derived, not read from the page. The derivation was allowed "
+        f"OthChrg -- the identity validate_item_total enforces -- using the amounts the "
+        f"row carries: read from the page, or filled by a rule whose own note appears "
+        f"beside this one. It was derived, not read from the page. The derivation was allowed "
         f"only because this invoice carries exactly one line item and the derived value "
         f"reconciles with the printed document total ValDtls.TotInvVal "
         f"({printed_total:.2f}) within the {tolerance:.10g} tolerance. On a multi-line "
         f"invoice, or where that reconciliation fails, this field is reported missing "
         f"instead and no payload is produced.",
+        severity="info",
+    )
+
+
+def _total_from_item_note(
+    path: str, item_path: str, value: float, printed_total: float, tolerance: float
+) -> ExtractionWarning:
+    """Report a document total filled from its single line item's counterpart.
+
+    Stage 2 sometimes returns null for a ``ValDtls`` total while returning the
+    row-level counterpart correctly in the same response. On an invoice with
+    exactly one line item the two are definitionally the same number, so the
+    total can be recovered without guessing -- under the same discipline as the
+    ``TotItemVal`` rule: one line item only, and a completed block that
+    reconciles with the printed document total.
+    """
+    return _note(
+        path,
+        f"{path} was returned null by stage 2, but this invoice carries exactly one "
+        f"line item, and on a single-line invoice {path} is definitionally the same "
+        f"number as {item_path}, which was read from the page. It was set to "
+        f"{value:.2f} from that identity. It was derived, not read. The derivation "
+        f"was allowed only because the completed ValDtls block reconciles with the "
+        f"printed document total ValDtls.TotInvVal ({printed_total:.2f}) within the "
+        f"{tolerance:.10g} tolerance, on the identity validate_invoice_total "
+        f"enforces. It fills a total only from a row value stage 2 read, never from "
+        f"one this pipeline derived. On a multi-line invoice the totals block "
+        f"constrains only the sum across rows, so nothing is derived there; where "
+        f"the reconciliation fails nothing is filled either, and a mandatory total "
+        f"is then reported missing and no payload is produced.",
         severity="info",
     )
 
@@ -461,6 +535,38 @@ def _record_structural_provenance(invoice: Invoice, provenance: dict[str, Any]) 
 # --------------------------------------------------------------------------- #
 
 
+def _retry_note(first: PipelineResult, second: PipelineResult) -> ExtractionWarning:
+    """Say that a retry happened, why, and which attempt this result is.
+
+    The retry is defensible only while it is visible: an unrecorded retry would
+    let a change in the underlying failure rate hide behind it.
+    """
+    missing = ", ".join(first.missing_fields) if first.missing_fields else "none recorded"
+    if second.extraction is not None:
+        outcome = (
+            f"This payload is the second attempt, taken whole. Responses are never merged "
+            f"across attempts, because each response is only internally coherent -- a "
+            f"payload spliced from two would be neither of them."
+        )
+    else:
+        outcome = (
+            f"The second attempt also produced no payload, and this result is the second "
+            f"attempt's. Two attempts are the limit: past that, re-asking the same "
+            f"question spends time without changing the honest answer, which is that "
+            f"this run could not read the document."
+        )
+    return _note(
+        "attempts",
+        f"Stage 2 was retried once, because the first attempt produced no payload "
+        f"(missing: {missing}) and nothing was refused -- the documented provider-side "
+        f"non-determinism makes that outcome an expected occasional event, not evidence "
+        f"about the document. {outcome} The attempt count is recorded in "
+        f"extraction_meta.attempts so a change in the underlying failure rate can never "
+        f"hide behind a silent retry.",
+        severity="info",
+    )
+
+
 def extract_invoice(
     path: str | os.PathLike[str],
     *,
@@ -472,7 +578,31 @@ def extract_invoice(
 
     ``client`` has no default: stage 2 never builds one, so this path cannot
     reach the network by accident.
+
+    A run that produces no payload with nothing refused is retried once, whole:
+    the measured provider-side non-determinism means such a run is usually a
+    resampling flake, not a fact about the document. A refusal is a decision and
+    is never retried. The two attempts are never merged -- the second result is
+    taken as it stands -- and ``extraction_meta.attempts`` records the count,
+    with an informational note, so the retry is always visible.
     """
+    first = _extract_invoice_once(path, client=client, model=model, tolerance=tolerance)
+    if first.extraction is not None or first.refusals:
+        return first
+    second = _extract_invoice_once(path, client=client, model=model, tolerance=tolerance)
+    second.meta.attempts = 2
+    second.meta.warnings.append(_retry_note(first, second))
+    return second
+
+
+def _extract_invoice_once(
+    path: str | os.PathLike[str],
+    *,
+    client: Any,
+    model: str = DEFAULT_MODEL,
+    tolerance: float = 0.05,
+) -> PipelineResult:
+    """One whole pass: ingest, stage 1, stage 2, assembly. No retry lives here."""
     ingested = ingest(path)
     page_metas = [PageMeta(page=p.page, method=p.method) for p in ingested.pages]
     pages = _read_pages(path, ingested)
@@ -675,12 +805,32 @@ def extract_invoice(
     for index, row in enumerate(llm.items):
         raw_values = {name: getattr(row, name) for name in MANDATORY_ITEM_FIELDS}
         discount = row.Discount or 0.0
+        # TotAmt and AssAmt are one discount apart, and stage 2 drops sometimes one
+        # and sometimes the other while reading the rest of the row. The pair of
+        # rules below is a single if/elif over the same two fields: each branch
+        # fires only when its own target is null and the other side was read, and
+        # each writes only its own target, so the two directions are mutually
+        # exclusive by construction -- a both-null row matches neither branch and
+        # refuses on both sides, and a value one branch derived can never be the
+        # other branch's source within this pass or any later one.
         if raw_values["TotAmt"] is None and raw_values["AssAmt"] is not None:
             raw_values["TotAmt"] = raw_values["AssAmt"] + discount
             derived_paths.add(f"ItemList[{index}].TotAmt")
             provenance[f"ItemList[{index}].TotAmt"] = dict(_DERIVED)
             pipeline_notes.append(_gross_from_taxable_note(
                 f"ItemList[{index}].TotAmt", raw_values["AssAmt"], discount
+            ))
+        elif raw_values["AssAmt"] is None and raw_values["TotAmt"] is not None and (
+            # Belt and braces on top of the elif: the source must be a stage-2
+            # reading of this row, the same condition the ValDtls totals rule puts
+            # on its counterparts.
+            (provenance.get(f"ItemList[{index}].TotAmt") or {}).get("source") == "llm"
+        ):
+            raw_values["AssAmt"] = raw_values["TotAmt"] - discount
+            derived_paths.add(f"ItemList[{index}].AssAmt")
+            provenance[f"ItemList[{index}].AssAmt"] = dict(_DERIVED)
+            pipeline_notes.append(_taxable_from_gross_note(
+                f"ItemList[{index}].AssAmt", raw_values["TotAmt"], discount
             ))
         # Only a row that carries real content gets a derived zero. A row that came back
         # wholly empty has nothing to derive from, and reporting every field missing is
@@ -703,8 +853,11 @@ def extract_invoice(
         # the document total. Derive it back from the INV-01 item identity, but only when
         # the document itself corroborates the result: exactly one line item, and a
         # derived value that reconciles with the printed ValDtls.TotInvVal on the same
-        # terms the validators compare on. Both conditions are checkable from amounts
-        # already read; neither involves guessing. On a multi-line invoice a per-row total
+        # terms the validators compare on. Both conditions are checkable from amounts the
+        # row already carries -- read, or filled by a row rule above (an AssAmt recovered
+        # from the read gross may feed this identity; the reconciliation against the
+        # printed total is what licenses the composition); neither involves guessing.
+        # On a multi-line invoice a per-row total
         # the document never states would assert a split across rows it never states
         # either, so the refusal stands there unchanged, however obvious the arithmetic
         # looks. A reconciliation that fails is evidence the reading is wrong, not licence
@@ -759,10 +912,81 @@ def extract_invoice(
                 pipeline_notes.append(_unprinted_tax_note(
                     f"ValDtls.{total}", intra, seller_stcd_raw, buyer_stcd_raw
                 ))
+    # The totals-block counterpart of the single-row TotItemVal rule above. Stage 2
+    # sometimes drops a ValDtls total while reading the row counterpart correctly in
+    # the same response, and on an invoice with exactly one line item the two are
+    # definitionally the same number. The direction is item-to-total only: a
+    # counterpart qualifies solely when stage 2 read it off the page, never when
+    # this module derived it, so an absent pair cannot bootstrap itself. Every
+    # recovered total is committed together with the others or not at all, and only
+    # when the completed block reconciles with the printed document total on the
+    # identity validate_invoice_total enforces. On a multi-line invoice the totals
+    # block constrains only the sum, so filling a total from one row would assert a
+    # split the document never states; nothing is derived there. A reconciliation
+    # that fails is evidence of a misreading, not licence to paper over it.
+    optional_reads = {name: llm.totals.get(name) for name in ("CesVal", "StCesVal", "RndOffAmt")}
+    derived_optional_totals: dict[str, float] = {}
+    if len(llm.items) == 1:
+        printed_total = llm.totals.get("TotInvVal")
+        single_row = llm.items[0]
+
+        def read_item_counterpart(item_name: str) -> float | None:
+            """The row's value, only when stage 2 read it off the page itself."""
+            value = getattr(single_row, item_name, None)
+            if value is None:
+                return None
+            entry = provenance.get(f"ItemList[0].{item_name}")
+            source = entry.get("source") if isinstance(entry, dict) else None
+            return value if source == "llm" else None
+
+        candidates: dict[str, tuple[str, float]] = {}
+        for total_name, item_name in TOTAL_FROM_ITEM:
+            already = (
+                raw_totals[total_name]
+                if total_name in raw_totals
+                else optional_reads[total_name]
+            )
+            if already is not None:
+                continue
+            counterpart = read_item_counterpart(item_name)
+            if counterpart is not None:
+                candidates[total_name] = (f"ItemList[0].{item_name}", counterpart)
+
+        if candidates and printed_total is not None:
+
+            def completed(name: str) -> float | None:
+                """The block's value for ``name`` once candidates are applied."""
+                if name in candidates:
+                    return candidates[name][1]
+                if name in raw_totals:
+                    return raw_totals[name]
+                value = optional_reads[name]
+                # An optional total nobody read lands on the schema default of
+                # zero, which is what validate_invoice_total will see.
+                return 0.0 if value is None else value
+
+            heads = [completed(name) for name in ("AssVal", "CgstVal", "SgstVal", "IgstVal")]
+            if all(head is not None for head in heads):
+                expected = sum(heads) + sum(
+                    completed(name) for name in ("CesVal", "StCesVal", "RndOffAmt")
+                )
+                if abs(expected - printed_total) <= tolerance + _EPSILON:
+                    for total_name, (item_path, value) in candidates.items():
+                        if total_name in raw_totals:
+                            raw_totals[total_name] = value
+                        else:
+                            derived_optional_totals[total_name] = value
+                        derived_paths.add(f"ValDtls.{total_name}")
+                        provenance[f"ValDtls.{total_name}"] = dict(_DERIVED)
+                        pipeline_notes.append(_total_from_item_note(
+                            f"ValDtls.{total_name}", item_path, value, printed_total, tolerance
+                        ))
+
     totals = {name: require(f"ValDtls.{name}", raw_totals[name]) for name in MANDATORY_TOTALS}
-    for optional in ("CesVal", "RndOffAmt"):
-        if llm.totals.get(optional) is not None:
-            totals[optional] = llm.totals[optional]
+    for optional in ("CesVal", "StCesVal", "RndOffAmt"):
+        value = derived_optional_totals.get(optional, optional_reads[optional])
+        if value is not None:
+            totals[optional] = value
 
     if not missing:
         # Place of supply is not extracted in build 2. Assuming it equals the buyer's

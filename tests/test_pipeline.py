@@ -81,7 +81,8 @@ class _Completions:
 
     def create(self, **kwargs):
         self._client.calls.append(kwargs)
-        return _Response(self._client.content)
+        contents = self._client.contents
+        return _Response(contents[min(len(self._client.calls), len(contents)) - 1])
 
 
 class _Chat:
@@ -90,10 +91,17 @@ class _Chat:
 
 
 class FakeClient:
-    """Exposes ``chat.completions.create`` and hands back one canned response."""
+    """Exposes ``chat.completions.create`` and hands back canned responses in order.
 
-    def __init__(self, payload):
-        self.content = payload if isinstance(payload, str) else json.dumps(payload)
+    One payload behaves as it always has: every call receives it. Extra payloads
+    are handed out one per call with the last repeating, which is all the retry
+    tests need.
+    """
+
+    def __init__(self, payload, *followups):
+        self.contents = [
+            p if isinstance(p, str) else json.dumps(p) for p in (payload, *followups)
+        ]
         self.calls = []
         self.chat = _Chat(self)
 
@@ -2011,3 +2019,609 @@ def test_a_printed_line_total_is_read_and_never_derived(clean_result):
         if w.field == "ItemList[0].TotItemVal" and w.check == "pipeline"
     ]
     assert pipeline_notes == []
+
+
+# --- derived document totals on a single-line invoice -------------------------------
+
+# A 60-run live measurement against sample_invoice.pdf (2026-09-16) found stage 2
+# returning null for a ValDtls total while reading the row counterpart correctly in
+# the same response: ValDtls.AssVal in 7 of 59 valid runs, CgstVal and SgstVal in 3,
+# and in every one of those runs the row value and the printed document total were
+# read. On an invoice with exactly one line item each document total is
+# definitionally the same number as its row counterpart, which is what licenses the
+# recovery. The rule is direction-locked: it fills a total only from a row value
+# stage 2 read (provenance "llm"), never from one the pipeline derived, so an absent
+# pair cannot bootstrap itself.
+#
+# StCesVal/StateCesAmt is in the identity set but cannot fire today: stage 2
+# extracts neither side, so the counterpart is never read. There is deliberately no
+# test pretending otherwise.
+#
+# Arithmetic for CLEAN_TEXT, transcribed by hand from the fixture: AssVal 6000.00 +
+# CgstVal 540.00 + SgstVal 540.00 + IgstVal 0.00 + CesVal 0 + StCesVal 0 +
+# RndOffAmt 0 = 7080.00, and the document prints "Total Invoice Value 7080.00".
+
+
+def _clean_response_without_totals(*names):
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    for name in names:
+        response["totals"][name] = None
+    return response
+
+
+@pytest.mark.parametrize(
+    ("total", "counterpart"),
+    [
+        ("AssVal", "ItemList[0].AssAmt"),
+        ("CgstVal", "ItemList[0].CgstAmt"),
+        ("SgstVal", "ItemList[0].SgstAmt"),
+    ],
+)
+def test_each_absent_total_is_derived_from_its_read_row_counterpart(
+    tmp_path, total, counterpart
+):
+    path = _text_pdf(tmp_path / f"no_{total}.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(_clean_response_without_totals(total)))
+
+    assert result.missing_fields == ()
+    assert isinstance(result.extraction, ExtractionResult)
+    # The derived value changes nothing: the payload is the hand-transcribed one.
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    assert result.meta.field_provenance[f"ValDtls.{total}"]["source"] == "derived"
+    # The row value it came from, and the total it reconciled against, stay readings.
+    assert result.meta.field_provenance[counterpart]["source"] == "llm"
+    assert result.meta.field_provenance["ValDtls.TotInvVal"]["source"] == "llm"
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_the_observed_failure_shape_derives_all_three_totals_together(tmp_path):
+    """The shape the measurement actually saw: AssVal, CgstVal and SgstVal null in
+    one response, every row value read. All three commit together or not at all."""
+    response = _clean_response_without_totals("AssVal", "CgstVal", "SgstVal")
+    path = _text_pdf(tmp_path / "three_totals.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    for total in ("AssVal", "CgstVal", "SgstVal"):
+        assert result.meta.field_provenance[f"ValDtls.{total}"]["source"] == "derived"
+    # IgstVal and TotInvVal were read, and stay readings.
+    assert result.meta.field_provenance["ValDtls.IgstVal"]["source"] == "llm"
+    assert result.meta.field_provenance["ValDtls.TotInvVal"]["source"] == "llm"
+
+
+def test_an_absent_igst_total_is_derived_on_an_inter_state_invoice(tmp_path):
+    # By hand from INTERSTATE_TEXT: AssVal 5000.00 + CgstVal 0.00 + SgstVal 0.00 +
+    # IgstVal 600.00 = 5600.00, and the document prints "Total Invoice Value 5600.00".
+    # On an inter-state supply IgstVal is a printed head, so the state-code zero rule
+    # does not touch it and only this identity can recover it.
+    response = json.loads(json.dumps(INTERSTATE_RESPONSE))
+    response["totals"]["IgstVal"] = None
+    path = _text_pdf(tmp_path / "no_igstval.pdf", INTERSTATE_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.ValDtls.IgstVal == 600.00
+    assert result.meta.field_provenance["ValDtls.IgstVal"]["source"] == "derived"
+    assert result.meta.field_provenance["ItemList[0].IgstAmt"]["source"] == "llm"
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_an_absent_cess_total_is_derived_from_the_read_item_cess(tmp_path):
+    # By hand from CESS_TEXT: AssVal 5000.00 + CgstVal 700.00 + SgstVal 700.00 +
+    # IgstVal 0.00 + CesVal 600.00 = 7000.00 = the printed "Total Invoice Value".
+    # CesVal is optional in INV-01, so its absence alone never blocks a payload; the
+    # derivation is what keeps the emitted block consistent with the read cess.
+    response = json.loads(json.dumps(CESS_RESPONSE))
+    response["totals"]["CesVal"] = None
+    path = _text_pdf(tmp_path / "no_cesval.pdf", CESS_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.ValDtls.CesVal == 600.00
+    assert result.meta.field_provenance["ValDtls.CesVal"]["source"] == "derived"
+    assert result.meta.field_provenance["ItemList[0].CesAmt"]["source"] == "llm"
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_the_derived_total_carries_a_note_naming_identity_and_reconciliation(tmp_path):
+    path = _text_pdf(tmp_path / "no_assval_note.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(_clean_response_without_totals("AssVal")))
+    notes = [
+        w for w in result.meta.warnings
+        if w.field == "ValDtls.AssVal" and w.check == "pipeline"
+    ]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.severity == "info"
+    # The note must name the row value it used, say the value was derived rather than
+    # read, and say what the completed block reconciled against -- those are the
+    # conditions the reader has to be able to check.
+    assert "ItemList[0].AssAmt" in note.message
+    assert "exactly one line item" in note.message
+    assert "derived, not read" in note.message
+    assert "ValDtls.TotInvVal" in note.message
+    assert "7080.00" in note.message
+
+
+def test_the_total_derivation_note_supersedes_stage_twos_absence_note(tmp_path):
+    """Stage 2's note promises the field was left empty rather than filled with a
+    guess. Deriving it makes that promise false, so the note is superseded."""
+    path = _text_pdf(tmp_path / "no_assval_supersede.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(_clean_response_without_totals("AssVal")))
+    notes = [w for w in result.meta.warnings if w.field == "ValDtls.AssVal"]
+    assert notes, "the field was derived silently"
+    assert not any("was not found in the document" in w.message for w in notes)
+
+
+def test_totals_that_do_not_reconcile_are_not_derived(tmp_path):
+    """A single-line invoice whose completed totals disagree with its own printed
+    total is reporting a reading problem, not inviting a patch."""
+    # The document now foots to 9000.00 while its own line arithmetic makes 7080.00.
+    # The per-row total stays printed (and grounded) so the only field in question
+    # is the one the reconciliation refuses to fill.
+    text = CLEAN_TEXT.replace(
+        "Total Invoice Value 7080.00",
+        "Line Total 7080.00\nTotal Invoice Value 9000.00",
+    )
+    response = _clean_response_without_totals("AssVal")
+    response["totals"]["TotInvVal"] = 9000.00
+    path = _text_pdf(tmp_path / "bad_foot_totals.pdf", text)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ValDtls.AssVal",)
+    assert "ValDtls.AssVal" not in result.meta.field_provenance
+    derivation_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ValDtls.AssVal" and "derived, not read" in w.message
+    ]
+    assert derivation_notes == []
+
+
+def test_a_multi_line_invoice_never_derives_a_missing_document_total(tmp_path):
+    """On a multi-line invoice the totals block constrains only the sum across rows,
+    so a total filled from one row asserts a split the document never states. The
+    refusal stands, however obvious the arithmetic looks."""
+    response = json.loads(json.dumps(MIXED_RATES_RESPONSE))
+    response["totals"]["AssVal"] = None
+    path = _text_pdf(tmp_path / "mixed_no_assval.pdf", MIXED_RATES_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ValDtls.AssVal",)
+    assert "ValDtls.AssVal" not in result.meta.field_provenance
+    derivation_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ValDtls.AssVal" and "derived, not read" in w.message
+    ]
+    assert derivation_notes == []
+
+
+def test_an_absent_pair_cannot_bootstrap_itself(tmp_path):
+    """The circularity the direction lock exists for: when nothing on either side
+    was read -- the total, the row's taxable value AND the row's gross that could
+    have recovered it -- nothing may invent any of them. All three are reported
+    missing and no payload is produced."""
+    response = _clean_response_without_totals("AssVal")
+    response["items"][0]["AssAmt"] = None
+    response["items"][0]["TotAmt"] = None
+    path = _text_pdf(tmp_path / "both_absent.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == (
+        "ItemList[0].TotAmt", "ItemList[0].AssAmt", "ValDtls.AssVal",
+    )
+    assert "ItemList[0].TotAmt" not in result.meta.field_provenance
+    assert "ItemList[0].AssAmt" not in result.meta.field_provenance
+    assert "ValDtls.AssVal" not in result.meta.field_provenance
+    assert not any("derived, not read" in w.message for w in result.meta.warnings)
+
+
+def test_a_derived_row_value_never_feeds_a_document_total(tmp_path):
+    """The chain the direction lock cuts: AssAmt recovered from the read gross is a
+    derivation, and the totals rule must refuse to consume it -- ValDtls.AssVal
+    stays missing even though a two-step chain to a read value exists. Across the
+    row/totals boundary, every derived value cites a reading directly; the
+    within-row composition (TotItemVal from a derived AssAmt) is pinned separately
+    below."""
+    response = _clean_response_without_totals("AssVal")
+    response["items"][0]["AssAmt"] = None  # TotAmt stays read at 6000.00
+    path = _text_pdf(tmp_path / "chain_locked.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ValDtls.AssVal",)
+    # The row side WAS legitimately recovered from its own read gross...
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "derived"
+    # ...and precisely because it is derived, it may not cross the block boundary.
+    assert "ValDtls.AssVal" not in result.meta.field_provenance
+    assert not any(
+        w.field == "ValDtls.AssVal" and "derived, not read" in w.message
+        for w in result.meta.warnings
+    )
+
+
+def test_a_zero_derived_counterpart_never_feeds_the_identity_rule(tmp_path):
+    """The reachable form of the counterpart-was-itself-derived case. On an
+    inter-state invoice with the CGST/SGST columns unprinted, the state-code rule
+    zero-fills both the item heads and the totals, so the item heads carry
+    provenance "derived" -- exactly what the identity rule must refuse to consume.
+    The totals it would have filled are already zero-filled by the state-code rule
+    before the identity rule runs, and the direction lock refuses the derived
+    counterpart besides; the assertion is that the totals' notes name the state
+    codes, and that no note claims the row identity was used."""
+    response = json.loads(json.dumps(INTERSTATE_RESPONSE))
+    for name in ("CgstAmt", "SgstAmt"):
+        response["items"][0][name] = None
+    for name in ("CgstVal", "SgstVal"):
+        response["totals"][name] = None
+    path = _text_pdf(tmp_path / "unprinted_heads.pdf", INTERSTATE_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    invoice = result.extraction.invoice
+    assert (invoice.ValDtls.CgstVal, invoice.ValDtls.SgstVal) == (0.00, 0.00)
+    for path_name in (
+        "ItemList[0].CgstAmt",
+        "ItemList[0].SgstAmt",
+        "ValDtls.CgstVal",
+        "ValDtls.SgstVal",
+    ):
+        assert result.meta.field_provenance[path_name]["source"] == "derived"
+    for total in ("ValDtls.CgstVal", "ValDtls.SgstVal"):
+        notes = [w for w in result.meta.warnings if w.field == total and w.check == "pipeline"]
+        assert len(notes) == 1
+        assert "state code" in notes[0].message
+        assert "definitionally the same number" not in notes[0].message
+
+
+def test_a_printed_document_total_is_read_and_never_derived(clean_result):
+    """When the totals block is printed and read, the rule does not fire and
+    provenance is the stage that read it."""
+    result, _ = clean_result
+    assert result.meta.field_provenance["ValDtls.AssVal"]["source"] == "llm"
+    assert result.extraction.invoice.ValDtls.AssVal == 6000.00
+    pipeline_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ValDtls.AssVal" and w.check == "pipeline"
+    ]
+    assert pipeline_notes == []
+
+
+# --- derived taxable value from the gross on the same row ---------------------------
+
+# The mirror of the shipped TotAmt = AssAmt + Discount rule, confined to one row:
+# AssAmt = TotAmt - Discount when AssAmt is null and TotAmt was read. Live evidence
+# (both 60-run batches, 2026-09-16): in all six runs where stage 2 returned null for
+# ItemList[0].AssAmt, the same row carried TotAmt read correctly, and TotAmt and
+# AssAmt were never null together in 119 valid runs. The rule is row-internal, so
+# unlike the totals rules it needs no single-line restriction.
+#
+# Arithmetic transcribed by hand from CLEAN_TEXT: gross = taxable here because no
+# discount is printed, so AssAmt = 6000.00 - 0 = 6000.00, identical to the printed
+# payload. For MIXED_RATES_TEXT row 2: AssAmt = 2000.00 - 0 = 2000.00.
+
+
+def test_an_absent_taxable_value_is_derived_from_the_read_gross(tmp_path):
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["AssAmt"] = None
+    path = _text_pdf(tmp_path / "no_assamt.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "derived"
+    assert result.meta.field_provenance["ItemList[0].TotAmt"]["source"] == "llm"
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_the_taxable_derivation_works_on_a_multi_line_invoice(tmp_path):
+    """Row-internal, so no single-line restriction: a row's gross constrains that
+    row alone, unlike a document total, which constrains only the sum."""
+    response = json.loads(json.dumps(MIXED_RATES_RESPONSE))
+    response["items"][1]["AssAmt"] = None
+    path = _text_pdf(tmp_path / "mixed_no_assamt.pdf", MIXED_RATES_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.ItemList[1].AssAmt == 2000.00
+    assert result.meta.field_provenance["ItemList[1].AssAmt"]["source"] == "derived"
+    # Row 0 read its own taxable value and is untouched.
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "llm"
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_the_taxable_derivation_note_names_the_identity_and_the_discount_risk(tmp_path):
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["AssAmt"] = None
+    path = _text_pdf(tmp_path / "no_assamt_note.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+    notes = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].AssAmt" and w.check == "pipeline"
+    ]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.severity == "info"
+    assert "AssAmt = TotAmt - Discount" in note.message
+    assert "derived, not read" in note.message
+    # The discount caveat is the risk the reader has to know about: an unread
+    # printed discount makes the derived value the gross.
+    assert "equals the gross amount" in note.message
+    # And the derivation note supersedes stage 2's left-empty promise.
+    absence = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].AssAmt" and "was not found in the document" in w.message
+    ]
+    assert absence == []
+
+
+def test_a_row_with_neither_gross_nor_taxable_refuses_on_both_sides(tmp_path):
+    """The mutual exclusion the pair of rules must keep: both null matches neither
+    branch, nothing is invented, both fields are reported missing."""
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["TotAmt"] = None
+    response["items"][0]["AssAmt"] = None
+    path = _text_pdf(tmp_path / "no_amounts.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ItemList[0].TotAmt", "ItemList[0].AssAmt")
+    assert "ItemList[0].TotAmt" not in result.meta.field_provenance
+    assert "ItemList[0].AssAmt" not in result.meta.field_provenance
+    assert not any(
+        "derived, not read" in w.message
+        for w in result.meta.warnings
+        if w.field in ("ItemList[0].TotAmt", "ItemList[0].AssAmt")
+    )
+
+
+def test_a_derived_gross_never_feeds_the_taxable_rule(tmp_path):
+    """When TotAmt is the null one, the shipped rule derives it FROM AssAmt, and the
+    elif direction means the taxable rule cannot then consume that derived gross.
+    Exactly one of the pair may ever be derived on a row."""
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["TotAmt"] = None
+    path = _text_pdf(tmp_path / "no_totamt.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.missing_fields == ()
+    assert result.meta.field_provenance["ItemList[0].TotAmt"]["source"] == "derived"
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "llm"
+    taxable_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].AssAmt" and w.check == "pipeline"
+    ]
+    assert taxable_notes == []
+
+
+def test_a_printed_taxable_value_is_read_and_never_derived(clean_result):
+    result, _ = clean_result
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "llm"
+    assert result.extraction.invoice.ItemList[0].AssAmt == 6000.00
+    pipeline_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].AssAmt" and w.check == "pipeline"
+    ]
+    assert pipeline_notes == []
+
+
+def test_the_dominant_failure_shape_recovers_through_the_composed_row_rules(tmp_path):
+    """The shape 4 of the 5 recorded post-0.1.3 no-payload runs actually had: AssAmt
+    and TotItemVal null together, everything else read. AssAmt comes back from the
+    read gross, and the single-row TotItemVal identity may then consume that derived
+    AssAmt -- the one permitted within-row composition, licensed by the
+    reconciliation against the printed document total.
+
+    Arithmetic by hand from CLEAN_TEXT: AssAmt = 6000.00 - 0 = 6000.00, then
+    TotItemVal = 6000.00 + 540.00 + 540.00 + 0 = 7080.00 = the printed
+    "Total Invoice Value 7080.00"."""
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["AssAmt"] = None
+    response["items"][0]["TotItemVal"] = None
+    client = FakeClient(response)
+    path = _text_pdf(tmp_path / "dominant_shape.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=client)
+
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "derived"
+    assert result.meta.field_provenance["ItemList[0].TotItemVal"]["source"] == "derived"
+    # Recovered on the first attempt: the derivations, not the retry, did the work.
+    assert result.meta.attempts == 1
+    assert len(client.calls) == 1
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+# The risk case the note warns about, pinned end to end: the document prints a
+# discount, stage 2 fails to read it, and the derived taxable value comes out equal
+# to the gross -- wrong by exactly the discount. The validators must flag the
+# disagreement visibly rather than let it pass.
+#
+# Arithmetic transcribed by hand from the fixture text below: Qty 4 x Rate 1625.00
+# = gross 6500.00, printed discount 500.00, true taxable 6000.00, GST 18% intra ->
+# CGST 540.00 + SGST 540.00, line total and invoice total 7080.00. With the
+# discount unread the derivation yields 6500.00 - 0 = 6500.00. Then
+# validate_item_total sees 6500 + 540 + 540 + 0 = 7580.00 against the printed
+# 7080.00 (off by the 500 discount), and validate_val_dtls_sums sees AssVal
+# 6000.00 against a row sum of 6500.00. validate_invoice_total still passes:
+# 6000 + 540 + 540 = 7080.00.
+
+DISCOUNT_TEXT = (
+    "TAX INVOICE\n"
+    "Seller: Nimbus Components Pvt Ltd\n"
+    "GSTIN 27AAPFU0939F1ZV\n"
+    "Plot 14 MIDC Andheri East\n"
+    "Mumbai 400093\n"
+    "Invoice No: INV-2026-0047\n"
+    "Invoice Date: 22/04/2026\n"
+    "Buyer: Kanchan Electricals LLP\n"
+    "GSTIN 27AABCB5507N1ZJ\n"
+    "221 Laxmi Road Shivajinagar\n"
+    "Pune 411005\n"
+    "Sl No 01 Laptop Stand\n"
+    "Qty 4 NOS Rate 1625.00\n"
+    "Gross 6500.00 Discount 500.00 Taxable 6000.00 GST 18%\n"
+    "CGST 540.00 SGST 540.00 IGST 0.00\n"
+    "HSN/SAC: 8471\n"
+    "Goods once sold will not be taken back or exchanged\n"
+    "Line Total 7080.00\n"
+    "Total Invoice Value 7080.00\n"
+)
+
+DISCOUNT_RESPONSE_WITH_UNREAD_DISCOUNT = {
+    "items": [
+        {
+            "SlNo": "01",
+            "PrdDesc": "Laptop Stand",
+            "HsnCd": "8471",
+            "Qty": 4,
+            "Unit": "NOS",
+            "UnitPrice": 1625.00,
+            "TotAmt": 6500.00,
+            "Discount": None,
+            "AssAmt": None,
+            "GstRt": 18,
+            "CgstAmt": 540.00,
+            "SgstAmt": 540.00,
+            "IgstAmt": 0.00,
+            "CesAmt": None,
+            "TotItemVal": 7080.00,
+        }
+    ],
+    "seller": {
+        "LglNm": "Nimbus Components Pvt Ltd",
+        "Addr1": "Plot 14 MIDC Andheri East",
+        "Loc": "Mumbai",
+        "Pin": "400093",
+    },
+    "buyer": {
+        "LglNm": "Kanchan Electricals LLP",
+        "Addr1": "221 Laxmi Road Shivajinagar",
+        "Loc": "Pune",
+        "Pin": "411005",
+    },
+    "totals": {
+        "AssVal": 6000.00,
+        "CgstVal": 540.00,
+        "SgstVal": 540.00,
+        "IgstVal": 0.00,
+        "CesVal": None,
+        "TotInvVal": 7080.00,
+        "RndOffAmt": None,
+    },
+}
+
+
+def test_an_unread_discount_makes_the_derivation_wrong_and_the_validators_say_so(tmp_path):
+    path = _text_pdf(tmp_path / "unread_discount.pdf", DISCOUNT_TEXT)
+    result = extract_invoice(path, client=FakeClient(DISCOUNT_RESPONSE_WITH_UNREAD_DISCOUNT))
+
+    # A payload IS produced -- the derivation is legal on what was read -- but the
+    # wrong value must not pass silently.
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.ItemList[0].AssAmt == 6500.00
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "derived"
+    assert any(
+        w.check == "validate_item_total" and w.field == "ItemList[0].TotItemVal"
+        for w in result.meta.warnings
+    )
+    assert any(
+        w.check == "validate_val_dtls_sums" and w.field == "ValDtls.AssVal"
+        for w in result.meta.warnings
+    )
+
+
+# --- one bounded stage-2 retry -------------------------------------------------------
+
+# A no-payload, no-refusal run is usually a resampling flake of the provider, not a
+# fact about the document (measured: 13.6% then 8.3% of runs, every one recovering
+# on other runs of the same document). The pipeline retries stage 2 once, takes the
+# second response whole or not at all, and records the attempt count.
+#
+# The guaranteed-failure response used here nulls both TotAmt and AssAmt on the one
+# row, the shape no derivation may touch: gross and taxable both unread.
+
+
+def _failing_response():
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["TotAmt"] = None
+    response["items"][0]["AssAmt"] = None
+    return response
+
+
+def test_a_no_payload_no_refusal_run_retries_once_and_takes_the_second_response(tmp_path):
+    client = FakeClient(_failing_response(), CLEAN_RESPONSE)
+    path = _text_pdf(tmp_path / "retry_recovers.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=client)
+
+    assert len(client.calls) == 2
+    assert result.missing_fields == ()
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    assert result.meta.attempts == 2
+    notes = [w for w in result.meta.warnings if w.field == "attempts"]
+    assert len(notes) == 1
+    assert notes[0].severity == "info"
+    assert notes[0].check == "pipeline"
+    assert "second attempt, taken whole" in notes[0].message
+    assert "never merged" in notes[0].message
+
+
+def test_a_single_attempt_records_one_and_carries_no_retry_note(clean_result):
+    result, client = clean_result
+    assert len(client.calls) == 1
+    assert result.meta.attempts == 1
+    assert [w for w in result.meta.warnings if w.field == "attempts"] == []
+
+
+def test_a_refusal_is_a_decision_and_is_not_retried(tmp_path):
+    """An export invoice is refused before stage 2 runs; retrying it would spend a
+    call to reach the same correct answer."""
+    client = FakeClient(CLEAN_RESPONSE)
+    path = _text_pdf(tmp_path / "export_no_retry.pdf", EXPORT_TEXT)
+    result = extract_invoice(path, client=client)
+
+    assert result.extraction is None
+    assert result.refusals
+    assert client.calls == []
+    assert result.meta.attempts == 1
+    assert [w for w in result.meta.warnings if w.field == "attempts"] == []
+
+
+def test_a_second_failure_gives_up_rather_than_looping(tmp_path):
+    # A third canned response WOULD succeed, so a pipeline that looped past two
+    # attempts would produce a payload here. Exactly two calls, then the honest no.
+    client = FakeClient(_failing_response(), _failing_response(), CLEAN_RESPONSE)
+    path = _text_pdf(tmp_path / "retry_gives_up.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=client)
+
+    assert len(client.calls) == 2
+    assert result.extraction is None
+    assert result.missing_fields == ("ItemList[0].TotAmt", "ItemList[0].AssAmt")
+    assert result.meta.attempts == 2
+    notes = [w for w in result.meta.warnings if w.field == "attempts"]
+    assert len(notes) == 1
+    assert "second attempt also produced no payload" in notes[0].message
+
+
+def test_attempts_are_never_merged_even_when_the_merge_would_succeed(tmp_path):
+    """First attempt fails on the row amounts; second reads them but drops the buyer
+    PIN. A merge of the two would be a complete payload; the pipeline must instead
+    report exactly the second attempt's failure."""
+    second = json.loads(json.dumps(CLEAN_RESPONSE))
+    second["buyer"]["Pin"] = None
+    client = FakeClient(_failing_response(), second)
+    path = _text_pdf(tmp_path / "no_merge.pdf", CLEAN_TEXT)
+    result = extract_invoice(path, client=client)
+
+    assert len(client.calls) == 2
+    assert result.extraction is None
+    # The second attempt's missing field, and only it: the first attempt's row
+    # amounts were read on the second attempt and are back in provenance.
+    assert result.missing_fields == ("BuyerDtls.Pin",)
+    assert result.meta.field_provenance["ItemList[0].TotAmt"]["source"] == "llm"
+    assert result.meta.field_provenance["ItemList[0].AssAmt"]["source"] == "llm"
+    assert "BuyerDtls.Pin" not in result.meta.field_provenance
+    assert result.meta.attempts == 2

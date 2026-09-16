@@ -102,6 +102,7 @@ def parse_invoice(path: str, tolerance: float = 0.05) -> dict[str, Any]:
             "pages": [{"page": p.page, "method": p.method} for p in result.meta.pages],
             "field_provenance": result.meta.field_provenance,
             "warnings": _warning_dicts(result.meta.warnings),
+            "attempts": result.meta.attempts,
         },
     }
 

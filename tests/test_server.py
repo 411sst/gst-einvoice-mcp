@@ -206,6 +206,7 @@ def test_parse_invoice_returns_the_payload_and_its_evidence(tmp_path, fake_groq)
     assert meta["pages"] == [{"page": 1, "method": "native"}]
     assert meta["field_provenance"]["SellerDtls.Gstin"]["source"] == "regex"
     assert all({"field", "severity", "check", "message"} == set(w) for w in meta["warnings"])
+    assert meta["attempts"] == 1
 
 
 def test_parse_invoice_is_json_serialisable(tmp_path, fake_groq):
