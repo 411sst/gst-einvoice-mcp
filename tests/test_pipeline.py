@@ -1887,3 +1887,127 @@ def test_a_blanked_glyph_is_reported_even_when_the_document_is_refused_anyway(
     # Nothing was parsed from this document, so the note does not claim any figure was
     # read as rupees -- that sentence would be false on a document with no payload.
     assert "parsed as rupees" not in glyph_notes[0].message
+
+
+# --- derived per-line total on a single-row invoice --------------------------------
+
+# CLEAN_TEXT prints a per-item taxable value, the tax split and a document-level total,
+# but no per-row total column -- the shape a real single-line invoice usually has, since
+# the per-row total and the invoice total are the same number and the template prints it
+# once. CLEAN_RESPONSE answers TotItemVal anyway, so these fixtures blank it to model what
+# a model reading this document actually returns: null for a column that is not there.
+#
+# Arithmetic transcribed by hand from CLEAN_TEXT: taxable 6000.00, CGST 540.00, SGST
+# 540.00, IGST 0.00, no cess, so AssAmt + CgstAmt + SgstAmt + IgstAmt + CesAmt +
+# StateCesAmt + OthChrg = 6000 + 540 + 540 + 0 + 0 + 0 + 0 = 7080.00, and the document
+# prints "Total Invoice Value 7080.00". The two agree, which is what licenses the rule.
+
+
+def _clean_response_without_line_total():
+    response = json.loads(json.dumps(CLEAN_RESPONSE))
+    response["items"][0]["TotItemVal"] = None
+    return response
+
+
+@pytest.fixture
+def unprinted_line_total(tmp_path):
+    path = _text_pdf(tmp_path / "no_line_total.pdf", CLEAN_TEXT)
+    return extract_invoice(path, client=FakeClient(_clean_response_without_line_total()))
+
+
+def test_a_single_row_invoice_derives_its_unprinted_line_total(unprinted_line_total):
+    result = unprinted_line_total
+    assert result.missing_fields == ()
+    assert isinstance(result.extraction, ExtractionResult)
+    # 6000.00 + 540.00 + 540.00 + 0.00, hand-added from CLEAN_TEXT above.
+    assert result.extraction.invoice.ItemList[0].TotItemVal == 7080.00
+    # The derived value is the whole payload's only difference from the printed-total run.
+    assert result.extraction.invoice.model_dump(exclude_none=True) == EXPECTED_CLEAN_PAYLOAD
+    # And it satisfies the identity the validator enforces, so nothing is flagged.
+    assert [w for w in result.meta.warnings if w.check in VALIDATOR_CHECKS] == []
+
+
+def test_the_derived_line_total_is_recorded_as_derived_not_read(unprinted_line_total):
+    result = unprinted_line_total
+    assert result.meta.field_provenance["ItemList[0].TotItemVal"]["source"] == "derived"
+    # The amounts it was derived from are still stage 2 readings, so they stay "llm".
+    for path in ("ItemList[0].AssAmt", "ItemList[0].CgstAmt", "ValDtls.TotInvVal"):
+        assert result.meta.field_provenance[path]["source"] == "llm"
+
+
+def test_the_derived_line_total_carries_a_note_naming_its_identity(unprinted_line_total):
+    notes = [
+        w for w in unprinted_line_total.meta.warnings
+        if w.field == "ItemList[0].TotItemVal" and w.check == "pipeline"
+    ]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.severity == "info"
+    assert "TotItemVal = AssAmt + CgstAmt + SgstAmt + IgstAmt" in note.message
+    assert "derived, not read from the page" in note.message
+    # The note must say the reconciliation happened and what it reconciled against,
+    # because that is the condition the reader has to be able to check.
+    assert "exactly one line item" in note.message
+    assert "ValDtls.TotInvVal" in note.message
+    assert "7080.00" in note.message
+
+
+def test_the_derivation_note_supersedes_stage_twos_absence_note(unprinted_line_total):
+    """Stage 2's note promises the field was left empty rather than filled with a guess.
+    Deriving it makes that promise false, so the note is superseded, not printed beside."""
+    notes = [
+        w for w in unprinted_line_total.meta.warnings
+        if w.field == "ItemList[0].TotItemVal"
+    ]
+    assert notes, "the field was derived silently"
+    assert not any("was not found in the document" in w.message for w in notes)
+
+
+def test_a_line_total_that_does_not_reconcile_is_not_derived(tmp_path):
+    """A single-row invoice whose derived total disagrees with its own printed total is
+    evidence the reading is wrong. The rule stands down and the refusal stands."""
+    # The document now foots to 9000.00 while its own line arithmetic makes 7080.00.
+    text = CLEAN_TEXT.replace("Total Invoice Value 7080.00", "Total Invoice Value 9000.00")
+    response = _clean_response_without_line_total()
+    response["totals"]["TotInvVal"] = 9000.00
+    path = _text_pdf(tmp_path / "bad_foot.pdf", text)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ItemList[0].TotItemVal",)
+    # Nothing may claim the field was derived, in the payload metadata or the warnings.
+    assert "ItemList[0].TotItemVal" not in result.meta.field_provenance
+    derivation_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].TotItemVal" and "derived, not read" in w.message
+    ]
+    assert derivation_notes == []
+
+
+def test_a_two_item_invoice_never_derives_a_missing_line_total(tmp_path):
+    """The case that must not regress. On a multi-row invoice, a per-row total the
+    document never states is a split across rows it never states either, however
+    obvious the arithmetic looks from the totals block."""
+    response = json.loads(json.dumps(MIXED_RATES_RESPONSE))
+    response["items"][1]["TotItemVal"] = None
+    path = _text_pdf(tmp_path / "mixed_no_line_total.pdf", MIXED_RATES_TEXT)
+    result = extract_invoice(path, client=FakeClient(response))
+
+    assert result.extraction is None
+    assert result.missing_fields == ("ItemList[1].TotItemVal",)
+    assert "ItemList[1].TotItemVal" not in result.meta.field_provenance
+    # Row 0 keeps its printed total and is not dragged into the refusal.
+    assert result.meta.field_provenance["ItemList[0].TotItemVal"]["source"] == "llm"
+
+
+def test_a_printed_line_total_is_read_and_never_derived(clean_result):
+    """The fourth case: when the document does print the column, it is read normally
+    and the rule does not fire. Provenance is the stage that read it."""
+    result, _ = clean_result
+    assert result.meta.field_provenance["ItemList[0].TotItemVal"]["source"] == "llm"
+    assert result.extraction.invoice.ItemList[0].TotItemVal == 7080.00
+    pipeline_notes = [
+        w for w in result.meta.warnings
+        if w.field == "ItemList[0].TotItemVal" and w.check == "pipeline"
+    ]
+    assert pipeline_notes == []

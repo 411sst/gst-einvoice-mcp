@@ -203,17 +203,37 @@ pages too.
 
 ### Some mandatory INV-01 fields are derived, not read
 
-INV-01 requires all three tax heads on every line, and a gross amount as well as a taxable
-value. Real invoice templates print only what applies: an intra-state invoice has no IGST
-column, an inter-state one has no CGST/SGST column, and an invoice with no discount prints
-one amount rather than two.
+INV-01 requires all three tax heads on every line, a gross amount as well as a taxable
+value, and a per-line total on every row. Real invoice templates print only what applies:
+an intra-state invoice has no IGST column, an inter-state one has no CGST/SGST column, an
+invoice with no discount prints one amount rather than two, and a single-line invoice
+prints its total once at the foot rather than twice.
 
 Where such a field is absent, the tool fills it from a rule rather than reporting the
 document unreadable, and records `"source": "derived"` in provenance with an informational
-note on every affected field:
+note on every affected field. There are three such rules:
 
 - the tax head that cannot apply is set to zero, from the two validated state codes;
-- `TotAmt` is set to `AssAmt + Discount`, the INV-01 identity.
+- `TotAmt` is set to `AssAmt + Discount`, the INV-01 identity;
+- `TotItemVal` is set to `AssAmt + CgstAmt + SgstAmt + IgstAmt + CesAmt + StateCesAmt +
+  OthChrg` — the identity `validate_item_total` enforces — but **only** when both of these
+  hold:
+  1. the invoice has **exactly one line item**, and
+  2. the derived value **reconciles with the printed `ValDtls.TotInvVal`**, within the same
+     tolerance the validators compare on (0.05 by default).
+
+**Why the per-line total is restricted to single-row invoices.** On a one-row invoice the
+per-row total and the document total are the same number, so the printed foot corroborates
+the derived value: the document does state it, once. On a multi-row invoice it does not.
+Asserting a per-row total the document never prints means asserting a **split across rows**
+that the document never prints either — the totals block constrains only the sum, and any
+number of per-row splits add to the same sum. That is exactly the guessing this tool exists
+not to do, so where there is more than one line item and `TotItemVal` is absent, the field
+is reported missing and no payload is produced, however obvious the arithmetic looks.
+
+The reconciliation condition is not a formality either. A single-row invoice whose derived
+line total disagrees with its own printed total is evidence that something was misread, not
+an invitation to paper over it; the rule stands down and the field is reported missing.
 
 **Consequence:** these values were not read off the page. The tax-head derivation inherits
 the Place of Supply approximation above, so confirm it for SEZ and bill-to/ship-to cases.
@@ -338,8 +358,10 @@ Live contact revealed one thing no fake could. The first pass produced a payload
 four of the twelve, because **INV-01 mandates fields that real invoice templates do not
 print** — the tax head that cannot apply, and a gross amount on an invoice with no
 discount. The model correctly answered null for a column that is not on the page, and the
-pipeline correctly refused to invent it. The derivation rules described above were added in
-response, and they are what took the pass rate from four to eleven.
+pipeline correctly refused to invent it. The first two derivation rules above — the
+inapplicable tax head and `TotAmt` — were added in response, and they are what took the
+pass rate from four to eleven. The third, the single-row `TotItemVal`, came later, from the
+same failure appearing on a document this suite's own "clean" fixture models.
 
 ---
 
@@ -369,14 +391,68 @@ means only that this attempt could not corroborate it. The distinction matters: 
 reports `ItemList[0].AssAmt` missing, do not conclude the invoice does not state a taxable
 value. Look at the document.
 
-The cause is that the model is non-deterministic even at temperature zero. This was
-observed directly: on one run the stage returned null for a taxable value plainly printed
-on the page, and on a later run of the identical fixture it read the same field correctly.
-The right thing happened both times — the field was reported missing and no payload was
-produced, rather than a value being invented — but it means **the same document can yield a
-payload on one attempt and a missing-field report on the next.**
+The cause is that the model is non-deterministic even at temperature zero, so **the same
+document can yield a payload on one attempt and a missing-field report on the next.** The
+right thing happens on both — the field is reported missing and no payload is produced,
+rather than a value being invented — but the two runs disagree.
 
-There is no code fix; it is a property of the model, not of this tool. Retrying a document
-that came back with a field missing is legitimate. What you must not do is treat a second,
-fuller answer as proof the first was faulty, or a missing-field report as proof about the
-invoice.
+**The rate has been measured.** Running stage 2 against `sample_invoice.pdf` 42 times, at
+temperature zero, with the same prompt and the same model (`openai/gpt-oss-120b`):
+
+| Field | Runs | Populated | Null |
+| ----- | ---- | --------- | ---- |
+| `ItemList[0].TotItemVal` | 42 | 28 | **14 (33%)** |
+| `ValDtls.AssVal`, `CgstVal`, `SgstVal`, `IgstVal`, `TotInvVal` | 42 | 42 | 0 |
+| `ItemList[0].AssAmt` | 12 | 12 | 0 |
+
+(`AssAmt` was recorded over only the first 12 of those runs, so its sample is smaller; the
+other rows cover all 42.)
+
+Roughly one run in three failed to read a single field, with nothing about the input
+changing between runs. That number is what tells you how much to trust a single run: on a
+document of this shape, one attempt is not a reading of the document, it is one sample.
+
+This is **provider-side non-determinism at temperature zero** — an artefact of mixture-of-
+experts routing and request batching, not of sampling temperature and not of the prompt.
+No prompt change fixes it, and `temperature` is already zero. Retrying a document that came
+back with a field missing is legitimate and, at a 33% per-field failure rate, often
+worthwhile. What you must not do is treat a second, fuller answer as proof the first was
+faulty, or a missing-field report as proof about the invoice.
+
+**One observation that is not characterised.** On a single run through the MCP server,
+`ValDtls.AssVal`, `CgstVal` and `SgstVal` all came back null together while `TotInvVal` was
+read normally. It has **never reproduced**: 66 subsequent runs against the same document,
+the same stage-2 code and the same model produced it zero times. It is recorded here as
+observed once and unreproduced, not as a known failure mode, because one occurrence cannot
+establish a rate.
+
+What makes it hard to dismiss as noise is that the failing run returned a *coherent partial
+reading* rather than corruption: `sample_invoice.pdf` has no separate totals block — its
+taxable and tax figures are printed on the item row, and the only document-level figure is
+the invoice total — so declining to reuse the item row's amounts as invoice totals is a
+defensible reading of that document. A rare semantic waver and rare noise that happened to
+look coherent cannot be told apart from one occurrence, so neither is claimed. Nothing
+derives `ValDtls.AssVal`, so if it does recur it blocks a payload.
+
+**Clearer labels on the invoice make extraction worse, not better.** The obvious response to
+a field that reads unreliably is to label it more explicitly on the document. That was
+tested against `sample_invoice.pdf`, 12 runs per variant, every figure held identical and
+only the labelling changed:
+
+| Variant | `ItemList[0].AssAmt` | `ItemList[0].TotItemVal` | `ValDtls` totals |
+| ------- | -------------------- | ------------------------ | ---------------- |
+| **A** — as printed (item row carries bare `Taxable 6000.00`, `CGST 540.00 SGST 540.00`) | **12 / 12** | **8 / 12** | 12 / 12 |
+| **B** — item row relabelled `Total Taxable Value` / `Total CGST` / `Total SGST` | 4 / 12 | 1 / 12 | 12 / 12 |
+| **C** — item row left intact, separate labelled totals block added | 10 / 12 | 4 / 12 | 12 / 12 |
+
+The document as printed outperformed both variants on every item field, and the labels
+bought nothing on the totals, which were read 12/12 in all three.
+
+The reading: **relabelling the item row as a totals block makes stage 2 stop treating it as
+an item row.** Variant B's amounts, prefixed with "Total", stopped reading as an item's
+amounts — `AssAmt` fell to a third of its baseline rate — while the `ValDtls` totals they now
+looked like were already being read correctly without the labels. Variant C, which left the
+item row alone and added a totals block beside it, was milder but still below baseline.
+
+So do not "improve" an invoice template by adding totals labels to the line-item row in the
+hope of more reliable extraction. On the evidence, that makes it worse.

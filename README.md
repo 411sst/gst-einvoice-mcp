@@ -222,7 +222,7 @@ This is the half most tools do not give you. Seven entries, from the run above, 
 
 Nothing in that list means the payload is wrong. Each one names something the tool could not corroborate, so you know where to look. The four arithmetic validators raised nothing, which is what silence from them means.
 
-On an invoice whose template omits a column — an intra-state invoice with no IGST column, or one that prints a taxable value but no separate gross — you will also see a `pipeline` note saying the field was derived rather than read, and `field_provenance` will record it as `"source": "derived"`.
+On an invoice whose template omits a column — an intra-state invoice with no IGST column, or one that prints a taxable value but no separate gross — you will also see a `pipeline` note saying the field was derived rather than read, and `field_provenance` will record it as `"source": "derived"`. The same applies to the per-line total on a **single-line** invoice that prints its total only at the foot: it is derived from the INV-01 item identity, but only when the invoice has exactly one line item and the derived value reconciles with the printed `ValDtls.TotInvVal`. On a multi-line invoice a missing `TotItemVal` is still reported missing and no payload is produced — see [LIMITATIONS.md](LIMITATIONS.md) for why.
 
 ### Provenance
 
@@ -255,9 +255,39 @@ On a scanned page the same fields carry real numbers — 0.86 to 0.96 on a clean
 pytest -q -W error
 ```
 
-1610 tests across ten modules, passing with warnings treated as errors. The LLM stage takes an injected client, so the whole suite runs with no API key and no network.
+1617 tests across ten modules, passing with warnings treated as errors. The LLM stage takes an injected client, so the whole suite runs with no API key and no network.
 
 The suite passes on both 3.11 and 3.13; 3.11 is the floor because that is the lowest version the whole dependency set resolves on, and it was verified by running the suite there rather than assumed.
+
+### Testing local changes through an MCP client
+
+**The MCP server runs whatever is installed in `site-packages`, not your working tree.** An
+MCP client launches the server through the `gst-einvoice-mcp` entry point, which resolves to
+the installed distribution. Editing a file in the repo changes nothing that the server
+serves until you reinstall, and there is no error to tell you — the tool call succeeds and
+returns the old behaviour.
+
+This is easy to lose an hour to. During the 0.1.2 work the repo carried a new derivation
+rule while the server was still serving 0.1.1, so a tool call against the new code silently
+exercised the old path and appeared to show the change had not worked.
+
+Either reinstall after every change:
+
+```bash
+pip install -e .        # editable, so later edits are picked up on server restart
+```
+
+or point the MCP client's `command` at the repo's own virtualenv instead of a user-level
+install, so the server and the tests run the same code:
+
+```jsonc
+// in your MCP client config
+"command": "C:\\path\\to\\repo\\.venv\\Scripts\\gst-einvoice-mcp.exe"
+```
+
+Either way, **restart the MCP server after changing code** — a running server holds the
+modules it imported at start-up. If a change seems to have no effect, check which copy is
+being served before looking for the bug in your code.
 
 | Module             | What it does                                                 |
 | ------------------ | ------------------------------------------------------------ |

@@ -99,7 +99,10 @@ from gst_einvoice.schema import (
     TranDtls,
     ValDtls,
 )
-from gst_einvoice.validators import validate_invoice
+# ``_EPSILON`` is imported rather than restated so the reconciliation guarding the
+# TotItemVal derivation below compares amounts on exactly the terms the validators
+# do; a second copy of the constant here could drift from the one that is enforced.
+from gst_einvoice.validators import _EPSILON, validate_invoice
 
 CHECK = "pipeline"
 #: Warnings carrying a build 1 refusal, or a detector re-run on OCR'd text.
@@ -374,6 +377,34 @@ def _gross_from_taxable_note(path: str, assamt: float, discount: float) -> Extra
         f"Discount, using the taxable value {assamt:.2f} and the discount {discount:.2f} "
         f"that were read. It was derived, not read from the page: if this invoice does "
         f"carry a gross figure that differs, the printed one is the correct value.",
+        severity="info",
+    )
+
+
+def _single_row_total_note(
+    path: str, value: float, printed_total: float, tolerance: float
+) -> ExtractionWarning:
+    """Report a per-line total filled from the INV-01 item identity.
+
+    INV-01 makes ``TotItemVal`` mandatory on every line, but on an invoice with a
+    single line item the per-row total and the document total are the same number,
+    so the template routinely prints it once at the foot rather than twice. The
+    rule is confined to that case, and to a derived value that reconciles with the
+    printed document total: on a multi-row invoice a per-row total the document
+    never states would assert a split across rows it never states either.
+    """
+    return _note(
+        path,
+        f"{path} (per-line total) is mandatory in INV-01 but is not printed as a column "
+        f"of its own on this document. It was set to {value:.2f} from the INV-01 identity "
+        f"TotItemVal = AssAmt + CgstAmt + SgstAmt + IgstAmt + CesAmt + StateCesAmt + "
+        f"OthChrg -- the identity validate_item_total enforces -- using the amounts that "
+        f"were read. It was derived, not read from the page. The derivation was allowed "
+        f"only because this invoice carries exactly one line item and the derived value "
+        f"reconciles with the printed document total ValDtls.TotInvVal "
+        f"({printed_total:.2f}) within the {tolerance:.10g} tolerance. On a multi-line "
+        f"invoice, or where that reconciliation fails, this field is reported missing "
+        f"instead and no payload is produced.",
         severity="info",
     )
 
@@ -667,6 +698,32 @@ def extract_invoice(
                     provenance[f"ItemList[{index}].{head}"] = dict(_DERIVED)
                     pipeline_notes.append(_unprinted_tax_note(
                         f"ItemList[{index}].{head}", intra, seller_stcd_raw, buyer_stcd_raw
+                    ))
+        # A single-row invoice routinely prints its per-line total once, at the foot, as
+        # the document total. Derive it back from the INV-01 item identity, but only when
+        # the document itself corroborates the result: exactly one line item, and a
+        # derived value that reconciles with the printed ValDtls.TotInvVal on the same
+        # terms the validators compare on. Both conditions are checkable from amounts
+        # already read; neither involves guessing. On a multi-line invoice a per-row total
+        # the document never states would assert a split across rows it never states
+        # either, so the refusal stands there unchanged, however obvious the arithmetic
+        # looks. A reconciliation that fails is evidence the reading is wrong, not licence
+        # to paper over it.
+        if raw_values["TotItemVal"] is None and len(llm.items) == 1:
+            printed_total = llm.totals.get("TotInvVal")
+            identity_heads = ("AssAmt", "CgstAmt", "SgstAmt", "IgstAmt")
+            if printed_total is not None and all(
+                raw_values[name] is not None for name in identity_heads
+            ):
+                # StateCesAmt and OthChrg are not extracted in build 2 and default to zero
+                # in the schema, so they contribute nothing to the identity here.
+                candidate = sum(raw_values[name] for name in identity_heads) + (row.CesAmt or 0.0)
+                if abs(candidate - printed_total) <= tolerance + _EPSILON:
+                    raw_values["TotItemVal"] = candidate
+                    derived_paths.add(f"ItemList[{index}].TotItemVal")
+                    provenance[f"ItemList[{index}].TotItemVal"] = dict(_DERIVED)
+                    pipeline_notes.append(_single_row_total_note(
+                        f"ItemList[{index}].TotItemVal", candidate, printed_total, tolerance
                     ))
         values = {
             name: require(f"ItemList[{index}].{name}", raw_values[name])
